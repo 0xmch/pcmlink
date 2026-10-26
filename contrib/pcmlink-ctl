@@ -85,7 +85,10 @@ NX_MATCH="^[^ ]*[Pp]ython[^ ]* pcmlink\.py receive --port $NORNS_PORT"
 # that can import gi.
 rx_python() {
     if [ -n "$PY" ]; then echo "$PY"; return 0; fi
-    for p in python3 $(IFS=:; for d in $PATH; do ls "$d"/python3.* 2>/dev/null; done | grep -E '/python3\.[0-9]+$'); do
+    # A glob, not ls: under set -e the first directory without a python3.N
+    # would end the search. An unmatched pattern is left as is, which the grep
+    # drops.
+    for p in python3 $(IFS=:; for d in $PATH; do printf '%s\n' "$d"/python3.*; done | grep -E '/python3\.[0-9]+$'); do
         if "$p" -c 'import gi' 2>/dev/null; then echo "$p"; return 0; fi
     done
     # None can; this one fails with pcmlink.py's own message in the log.
