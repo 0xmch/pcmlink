@@ -50,7 +50,7 @@ VOLUME="${PCMLINK_CTL_VOLUME:-1.0}"
 WIN="${PCMLINK_CTL_WIN_HOST:-win11}"
 LINUX="${PCMLINK_CTL_LINUX_HOST:-pc}"
 LOG="${PCMLINK_CTL_LOG:-$HOME/Library/Logs/pcmlink/receive.log}"
-PY="${PCMLINK_CTL_PYTHON:-python3}"
+PY="${PCMLINK_CTL_PYTHON:-}"
 NORNS="${PCMLINK_CTL_NORNS_HOST:-norns}"
 NORNS_PORT="${PCMLINK_CTL_NORNS_PORT:-5006}"
 NORNS_LOG="${PCMLINK_CTL_NORNS_LOG:-$HOME/Library/Logs/pcmlink/receive-norns.log}"
@@ -77,16 +77,32 @@ c_ok=$(printf '\033[32m'); c_bad=$(printf '\033[31m'); c_dim=$(printf '\033[2m')
 RX_MATCH='^[^ ]*[Pp]ython[^ ]* pcmlink\.py receive --device'
 NX_MATCH="^[^ ]*[Pp]ython[^ ]* pcmlink\.py receive --port $NORNS_PORT"
 
+# The interpreter for the receivers, which need PyGObject. Homebrew points
+# python3 at each new python@3.x as soon as it is installed, and pygobject3 can
+# lag behind: python3 became 3.15 while gi existed only for 3.14, and every
+# receiver start failed with "No module named 'gi'". So unless
+# PCMLINK_CTL_PYTHON names one, take the first python3 or python3.N on PATH
+# that can import gi.
+rx_python() {
+    if [ -n "$PY" ]; then echo "$PY"; return 0; fi
+    for p in python3 $(IFS=:; for d in $PATH; do ls "$d"/python3.* 2>/dev/null; done | grep -E '/python3\.[0-9]+$'); do
+        if "$p" -c 'import gi' 2>/dev/null; then echo "$p"; return 0; fi
+    done
+    # None can; this one fails with pcmlink.py's own message in the log.
+    echo python3
+}
+
 rx_pid() { pgrep -f "$RX_MATCH" 2>/dev/null | head -1; }
 rx_count() { pgrep -f "$RX_MATCH" 2>/dev/null | wc -l | tr -d ' '; }
 
 rx_start() {
     if [ -n "$(rx_pid)" ]; then echo "receiver already running (pid $(rx_pid))"; return 0; fi
     mkdir -p "$(dirname "$LOG")"
+    py=$(rx_python)
     # Detach completely: stdin from /dev/null and both outputs to the log, so
     # the child holds none of this script's file descriptors open. Without that
     # a caller waiting on our output blocks until the receiver itself exits.
-    ( cd "$DIR" && nohup "$PY" pcmlink.py receive --device "$DEVICE" --volume "$VOLUME" \
+    ( cd "$DIR" && nohup "$py" pcmlink.py receive --device "$DEVICE" --volume "$VOLUME" \
         </dev/null >>"$LOG" 2>&1 & ) >/dev/null 2>&1
     sleep 2
     if [ -n "$(rx_pid)" ]; then echo "receiver started (pid $(rx_pid))"
@@ -108,7 +124,8 @@ nx_pid() { pgrep -f "$NX_MATCH" 2>/dev/null | head -1; }
 nx_start() {
     if [ -n "$(nx_pid)" ]; then echo "norns receiver already running (pid $(nx_pid))"; return 0; fi
     mkdir -p "$(dirname "$NORNS_LOG")"
-    ( cd "$DIR" && nohup "$PY" pcmlink.py receive --port "$NORNS_PORT" --device "$DEVICE" \
+    py=$(rx_python)
+    ( cd "$DIR" && nohup "$py" pcmlink.py receive --port "$NORNS_PORT" --device "$DEVICE" \
         --volume "$VOLUME" </dev/null >>"$NORNS_LOG" 2>&1 & ) >/dev/null 2>&1
     sleep 2
     if [ -n "$(nx_pid)" ]; then echo "norns receiver started (pid $(nx_pid))"
@@ -146,7 +163,7 @@ norns_ip() { ssh -G "$NORNS" 2>/dev/null | awk '$1 == "hostname" { print $2 }'; 
 
 # Set a norns parameter by id; needs the norns-remote mod on the norns.
 norns_setid() {
-    "$PY" - "$(norns_ip)" "$1" "$2" <<'EOF'
+    "${PY:-python3}" - "$(norns_ip)" "$1" "$2" <<'EOF'
 import socket, struct, sys
 host, name, value = sys.argv[1], sys.argv[2], float(sys.argv[3])
 pad = lambda b: b + b"\0" * (4 - len(b) % 4)
@@ -440,7 +457,7 @@ environment:
   PCMLINK_CTL_LINUX_HOST  ssh host alias of the Linux sender  (default: pc)
   PCMLINK_CTL_WIN_HOST    ssh host alias of the Windows VM    (default: win11)
   PCMLINK_CTL_LOG         receiver log path
-  PCMLINK_CTL_PYTHON      interpreter to run the receiver     (default: python3)
+  PCMLINK_CTL_PYTHON      interpreter to run the receiver     (default: first python3[.N] with gi)
   PCMLINK_CTL_NORNS_HOST  ssh host alias of the norns         (default: norns)
   PCMLINK_CTL_NORNS_PORT  UDP port of the norns link          (default: 5006)
   PCMLINK_CTL_NORNS_LOG   norns receiver log path
