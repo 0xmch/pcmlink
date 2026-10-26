@@ -131,7 +131,8 @@ from when it is not the clock master.
 `start-rx` does nothing if a receiver is already running, so it is safe to run
 at login from something that runs inside your desktop session, such as
 Hammerspoon or a login item. Don't use launchd: a receiver started by launchd
-is invisible to SoundSource.
+is invisible to SoundSource. `contrib/pcmlink-login.command` is such a login
+item: macOS opens it in Terminal, which runs `start-rx` and `start-norns-rx`.
 
 ## Which endpoint to capture
 
