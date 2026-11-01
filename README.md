@@ -302,6 +302,68 @@ it to receive from other machines, once, and recognises it by its signature
 `buf` is the buffer's average and lowest level over the last second, and
 `drift` the correction the resampler currently applies.
 
+## Mixer (mixer/)
+
+`pcmlink-mixer` is a terminal mixer in the spirit of alsamixer: one strip per
+stream, and, where a client runs an agent, one strip per application playing
+there. Each has a stereo meter, a fader and a mute, next to the link's health:
+buffer, packet rate, drift, losses and dropouts. Build it with
+`cargo build --release` in `mixer/`.
+
+```
+pcmlink-mixer            # the mixer; the keys are on screen, ? explains them, q or Ctrl+C quits
+pcmlink-mixer --list     # what's there now, one line per stream and application
+pcmlink-mixer --json     # the same for scripts
+```
+
+No client is configured anywhere:
+
+- **Streams** are found by their sockets. Each `pcmlink-rx` publishes a control
+  socket named after its port in `~/Library/Application Support/pcmlink/rx/` (or
+  `$PCMLINK_RX_DIR`), and the mixer lists that directory.
+- **Clients** are the addresses the packets come from. Two streams from one
+  machine sit under one client, and a new machine appears when it starts sending.
+  A client goes by the first of these that exists: its alias in `~/.ssh/config`,
+  the name its agent reports, its name over multicast DNS (Avahi and macOS answer,
+  Windows doesn't), reverse DNS, its address.
+- **Applications** come from the agent, if that address answers on TCP port 5003.
+  Without one the client just has its stream strips.
+
+Gain on a stream strip is applied by the receiver, with a short ramp so it doesn't
+click. It starts from `--volume` and isn't kept across a restart. Gain on an
+application strip is the operating system's own per-application volume, so it
+shows up in the system's mixer as well, and survives whatever the system keeps it
+through. Keys and the mouse stop at 0 dB, and clicking high on a fader raises it
+6 dB at most, so a slip can't take a quiet strip to full level.
+
+### The agent
+
+```
+pcmlink service install agent -- --allow RECEIVER_ADDRESS [--hide NAME ...]
+```
+
+`--allow` names the machine the mixer runs on. Nothing else but the machine itself
+may connect. On Windows this adds a firewall rule for that address and a scheduled
+task that runs at logon in the desktop session, hidden. It has to be that session:
+Windows lists a session's applications only to that session, and a process in
+session 0, where the sender runs, sees neither them nor their audio.
+
+| Platform | Backend | One strip per | Notes |
+| --- | --- | --- | --- |
+| Windows | WASAPI sessions | program | a browser's tabs share one strip; titles come from Windows' media controls and the window title |
+| Linux | PulseAudio or PipeWire, through `pactl` and `parec` | stream | a browser's tabs are separate strips |
+| others | none | - | reports the machine's name only |
+
+The agent does nothing while no mixer is connected. The protocol is one JSON
+object per line, described at the top of `pcmlink_agent.py`, so a machine with no
+backend here can get an agent in any language.
+
+Programs that capture the mix rather than play it (a game-streaming host, say)
+are listed among those playing, at the level of the whole mix, because Windows
+reports them the same way. The agent hides pcmlink's own sender; `--hide` names
+any others on that machine. Application meters read before the application's
+volume, so a muted program still shows what it is playing.
+
 ## Volume
 
 `--volume` applies a software gain: `1.0` is unity, `0.5` is roughly −6 dB,

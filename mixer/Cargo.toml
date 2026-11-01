@@ -1,0 +1,16 @@
+[package]
+name = "pcmlink-mixer"
+version = "0.1.0"
+edition = "2021"
+description = "Terminal mixer for pcmlink: every stream, every client, every application"
+license = "MIT"
+publish = false
+
+[dependencies]
+libc = "0.2"
+ratatui = "0.30"
+serde_json = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
