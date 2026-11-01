@@ -88,11 +88,16 @@ command line works as a service.
 |---|---|---|
 | macOS | hidden login item (`~/Applications/pcmlink.app`) | in-process, `retry_delay` seconds |
 | Linux | systemd `--user` unit; `send` is bound to `graphical-session.target` | `Restart=always`, `RestartSec=5` |
-| Windows | Task Scheduler, at logon, hidden | 3 retries at 1-minute intervals |
+| Windows | Task Scheduler, at boot, as you in session 0 (S4U) | in-process, `retry_delay` seconds; a 1-minute watchdog trigger if the program itself is killed |
 
-Windows restarts are noticeably slower than the other two: Task Scheduler's
-minimum retry interval is one minute, so a crash there costs a minute of
-silence rather than seconds.
+**The Windows sender runs in session 0**, the desktop-less session services
+use, as your own account without a stored password. Nothing it starts can
+open a window or be closed from the taskbar, it starts before anyone logs on,
+and WASAPI loopback capture works there. Installing it needs an elevated
+prompt. The pipeline restarts in-process, like on macOS, because Task
+Scheduler's restart-on-failure ignores exit codes; a lost audio device costs
+`retry_delay` seconds. The watchdog is a time trigger that fires every minute
+and does nothing while the sender runs.
 
 **macOS deliberately does not use a launchd agent.** A process started by
 launchd is not visible to per-application audio tools — SoundSource could not
@@ -122,6 +127,11 @@ pcmlink-ctl start-rx    # receiver only, and only if it is not already running
 pcmlink-ctl logs        # follow the receiver log
 ```
 
+A Linux host gets a link of its own on port 5010, so it can play at the same
+time as the Windows host: `pcmlink-ctl linux` (status), `start-linux`,
+`restart-linux`, `stop-linux`. Its sender is the systemd user unit, installed
+with `pcmlink service install send -- --host <mac> --port 5010`.
+
 `status` samples the log twice and requires a non-zero packet rate, so a
 receiver that is running while the sender is silent reports as **no packets**
 rather than a false green. It also shows the output device and the sample rate
@@ -133,8 +143,17 @@ at login from something that runs inside your desktop session, such as
 Hammerspoon or a login item. Don't use launchd: a receiver started by launchd
 is invisible to SoundSource. `contrib/pcmlink-login.applescript` builds such a
 login item: an app that has Terminal run `contrib/pcmlink-login.command`, which
-runs `start-rx` and `start-norns-rx` and logs to
-`~/Library/Logs/pcmlink/login.log`.
+runs `start-rx`, `start-linux-rx` and `start-norns-rx` and logs to
+`~/Library/Logs/pcmlink/login.log`. It opens a Terminal window at every login, so starting the receivers
+from Hammerspoon (`hs.task`) is the quieter choice; a receiver started that way
+is visible to SoundSource too.
+
+Starting too early has the same effect as launchd: SoundSource never picks up
+a receiver that starts while SoundSource itself is still starting, so that
+receiver bypasses its volume and effects until it is restarted. The `start-*`
+commands therefore wait until SoundSource has run for 20 s
+(`PCMLINK_CTL_SS_SETTLE`), and take a lock so that two starters at login
+cannot start the same receiver twice.
 
 ## Which endpoint to capture
 
@@ -270,14 +289,20 @@ control.
 The receiver prints one line per second:
 
 ```
-14:01:09  jb= 99%  pkt/s= 200  avg= 201.08  lost=0 late=0 dup=0 qos=0 warn=0
+14:01:09  jb= 99%  pkt/s= 200  avg= 201.08  lost=0 late=0 dup=0 warn=0
 ```
 
 - `jb` — jitterbuffer fill; steady near 100% is healthy, sagging means starvation
-- `pkt/s` / `avg` — instantaneous and cumulative packet rate
+- `pkt/s` / `avg` — packets leaving the jitterbuffer, per second and since the
+  first packet
 - `lost` / `late` / `dup` — packets missing, too late to use, or repeated
-- `qos` — buffers the output device dropped
 - `warn` — pipeline warnings, also printed in full
+
+These counters only see the network. Samples the sender fails to capture never
+become packets, and the output can still skip or pad audio to stay in sync. The
+audio sink logs each such correction on its own line (`correct clock skew`,
+`Unexpected discontinuity ... resyncing`); `pcmlink-ctl status` counts them on
+its `output` line.
 
 `avg` is the useful long-run number. Its absolute value depends on how many
 frames the capture source puts in each buffer, so it differs between sources
@@ -322,7 +347,18 @@ pipelines:
 - **A hidden scheduled task does not hide its children.** `gst-launch-1.0.exe`
   is a console application, so Windows opens a console for it even when the
   parent is `pythonw.exe` and the task is marked hidden. The child must be
-  spawned with `CREATE_NO_WINDOW`.
+  spawned with `CREATE_NO_WINDOW`. The same goes for pip's `pcmlink.exe`
+  launcher, so the service runs `pythonw.exe` and the script directly.
+- **Ending a scheduled task does not kill its children.** A leftover
+  `gst-launch-1.0.exe` keeps streaming, and the next start adds a second RTP
+  stream on the same port, which the receiver scores as huge packet loss. The
+  sender puts its child in a kill-on-close job object, so the child dies with it.
+- **Task Scheduler's restart-on-failure never fires for a program that exits
+  with an error**, only for one that fails to launch. A repetition on a boot
+  or logon trigger only begins once that trigger has fired, so a watchdog
+  needs its own time trigger.
+- **Under OpenSSH, `%USERDOMAIN%` is `WORKGROUP`**, so `DOMAIN\user` does not
+  resolve in a task definition. Use the SID from `whoami /user`.
 - **`shutil.which()` is unsafe for locating an installed console script on
   Windows**: `PATHEXT` includes `.PY` and the current directory is searched, so
   it will cheerfully return the source file and a generated service will try to

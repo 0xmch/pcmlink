@@ -6,18 +6,22 @@
 # log path elsewhere.
 #
 #   receiver (this Mac)      pcmlink.py receive  ->  RME Babyface
-#   sender   (Linux host)    systemd --user unit "pcmlink-send", bound to the
-#                            graphical session
-#   sender   (Windows VM)    scheduled task "pcmlink-send"
+#   sender   (Windows PC)    scheduled task "pcmlink-send"
 #
-# A second, independent link carries a norns (monome) to the same interface:
+# Two more, independent links carry a Linux box and a norns (monome) to the same
+# interface, so all three can play at once:
+#
+#   receiver (this Mac)      pcmlink.py receive --port 5010  ->  RME Babyface
+#   sender   (Linux host)    systemd --user unit "pcmlink-send", bound to the
+#                            graphical session, sending to port 5010
 #
 #   receiver (this Mac)      pcmlink.py receive --port 5006  ->  RME Babyface
 #   sender   (norns)         system unit "pcmlink-send", tapping JACK
 #                            crone:output_1/2 (the norns main mix)
 #
-# It has its own port and log, so starting, stopping or restarting one link
-# never touches the other. The norns commands are the *-norns ones.
+# Each has its own port and log, so starting, stopping or restarting one link
+# never touches the others. The Linux commands are the *-linux ones, the norns
+# commands the *-norns ones.
 #
 # The other way, this Mac's audio can feed the norns input, for scripts to
 # process (start-norns-in):
@@ -33,11 +37,6 @@
 # The feed also mutes the norns' input monitoring (you hear the source here
 # already), through the norns-remote mod's /norns-remote/setid command.
 #
-# The Linux host and the Windows VM share one display, so at most one of them
-# has a desktop session and only that one should send. The Linux host is asked
-# first: if its graphical session is up, it is the sender and the VM is not
-# queried, which also avoids waiting on ssh timeouts to a VM that is off.
-#
 # The receiver is deliberately started from your shell rather than by launchd:
 # a launchd-spawned process is invisible to SoundSource, so its volume control
 # would stop working. Keep it that way.
@@ -47,8 +46,10 @@ set -eu
 DIR="${PCMLINK_DIR:-$HOME/projects/pcmlink}"
 DEVICE="${PCMLINK_CTL_DEVICE:-Babyface}"
 VOLUME="${PCMLINK_CTL_VOLUME:-1.0}"
-WIN="${PCMLINK_CTL_WIN_HOST:-win11}"
+WIN="${PCMLINK_CTL_WIN_HOST:-winpc}"
 LINUX="${PCMLINK_CTL_LINUX_HOST:-pc}"
+LINUX_PORT="${PCMLINK_CTL_LINUX_PORT:-5010}"
+LINUX_LOG="${PCMLINK_CTL_LINUX_LOG:-$HOME/Library/Logs/pcmlink/receive-linux.log}"
 LOG="${PCMLINK_CTL_LOG:-$HOME/Library/Logs/pcmlink/receive.log}"
 PY="${PCMLINK_CTL_PYTHON:-}"
 NORNS="${PCMLINK_CTL_NORNS_HOST:-norns}"
@@ -71,11 +72,12 @@ c_ok=$(printf '\033[32m'); c_bad=$(printf '\033[31m'); c_dim=$(printf '\033[2m')
 # then takes that shell for a running receiver and starts nothing, and pkill
 # kills the shell.
 #
-# The first argument tells the two receivers apart: the PC one is started as
-# "receive --device ...", the norns one as "receive --port <NORNS_PORT> ...".
-# Keep that order in rx_start and nx_start, or each will see the other.
+# The first argument tells the receivers apart: the Windows one is started as
+# "receive --device ...", the Linux and norns ones as "receive --port <port> ...".
+# Keep that order in rx_start, lx_start and nx_start, or each will see another.
 RX_MATCH='^[^ ]*[Pp]ython[^ ]* pcmlink\.py receive --device'
-NX_MATCH="^[^ ]*[Pp]ython[^ ]* pcmlink\.py receive --port $NORNS_PORT"
+LX_MATCH="^[^ ]*[Pp]ython[^ ]* pcmlink\.py receive --port $LINUX_PORT "
+NX_MATCH="^[^ ]*[Pp]ython[^ ]* pcmlink\.py receive --port $NORNS_PORT "
 
 # The interpreter for the receivers, which need PyGObject. Homebrew points
 # python3 at each new python@3.x as soon as it is installed, and pygobject3 can
@@ -95,10 +97,53 @@ rx_python() {
     echo python3
 }
 
+# ---- starting a receiver: after SoundSource has settled, one starter at a time
+#
+# SoundSource never picks up a receiver that starts while it is still starting
+# itself: at the 2026-10-31 login the PC receiver started 5 s after SoundSource
+# and played straight to the device, outside SoundSource's volume and effects
+# (EarComp), until it was restarted. Its process taps are private, so there is
+# no readiness signal to wait for; wait until it has run SS_SETTLE seconds. If
+# it is installed but not running yet (early in login), wait up to a minute.
+#
+# The lock matters at login: the login item and Hammerspoon both call start-*,
+# and after the same wait both would see no receiver and start one each.
+SS_SETTLE="${PCMLINK_CTL_SS_SETTLE:-20}"
+START_LOCK="$HOME/Library/Caches/pcmlink/start.lock"
+
+ss_uptime() {
+    pid=$(pgrep -x SoundSource 2>/dev/null | head -1)
+    [ -n "$pid" ] || return 1
+    # etime is [[dd-]hh:]mm:ss
+    ps -o etime= -p "$pid" | awk '{ n = split($1, a, /[-:]/); s = 0
+        for (i = 1; i <= n; i++) s = s * ((n == 4 && i == 2) ? 24 : 60) + a[i]
+        print s }'
+}
+
+start_gate() {
+    [ -n "${HAVE_START_LOCK:-}" ] && return 0
+    if [ -d /Applications/SoundSource.app ]; then
+        waited=0
+        while :; do
+            up=$(ss_uptime) || up=
+            if [ -n "$up" ]; then [ "$up" -ge "$SS_SETTLE" ] && break
+            elif [ "$waited" -ge 60 ]; then break; fi
+            [ "$waited" -eq 0 ] && echo "waiting for SoundSource to settle"
+            sleep 1; waited=$((waited + 1))
+        done
+    fi
+    mkdir -p "$(dirname "$START_LOCK")"
+    # shlock writes our pid and takes over a lock whose holder has died.
+    until shlock -f "$START_LOCK" -p $$; do sleep 0.2; done
+    HAVE_START_LOCK=1
+    trap 'rm -f "$START_LOCK"' EXIT
+}
+
 rx_pid() { pgrep -f "$RX_MATCH" 2>/dev/null | head -1; }
 rx_count() { pgrep -f "$RX_MATCH" 2>/dev/null | wc -l | tr -d ' '; }
 
 rx_start() {
+    start_gate
     if [ -n "$(rx_pid)" ]; then echo "receiver already running (pid $(rx_pid))"; return 0; fi
     mkdir -p "$(dirname "$LOG")"
     py=$(rx_python)
@@ -120,11 +165,68 @@ rx_stop() {
     echo "receiver stopped (was pid $pid)"
 }
 
+# ---- Linux link: same receiver program, its own port and log
+
+lx_pid() { pgrep -f "$LX_MATCH" 2>/dev/null | head -1; }
+
+lx_start() {
+    start_gate
+    if [ -n "$(lx_pid)" ]; then echo "linux receiver already running (pid $(lx_pid))"; return 0; fi
+    mkdir -p "$(dirname "$LINUX_LOG")"
+    py=$(rx_python)
+    ( cd "$DIR" && nohup "$py" pcmlink.py receive --port "$LINUX_PORT" --device "$DEVICE" \
+        --volume "$VOLUME" </dev/null >>"$LINUX_LOG" 2>&1 & ) >/dev/null 2>&1
+    sleep 2
+    if [ -n "$(lx_pid)" ]; then echo "linux receiver started (pid $(lx_pid))"
+    else echo "${c_bad}linux receiver failed to start${c_off}; see $LINUX_LOG"; return 1; fi
+}
+
+lx_stop() {
+    pid=$(lx_pid) || true
+    if [ -z "${pid:-}" ]; then echo "linux receiver not running"; return 0; fi
+    pkill -f "$LX_MATCH" 2>/dev/null || true
+    sleep 1
+    echo "linux receiver stopped (was pid $pid)"
+}
+
+# systemctl --user on the Linux host. Prints the unit state (active, inactive,
+# failed, ...) or nothing when the host is unreachable.
+linux_q() {
+    ssh -o ConnectTimeout=8 -o BatchMode=yes "$LINUX" "systemctl --user is-active $1" \
+        2>/dev/null | tail -1
+}
+
+# The Linux sender is a user unit bound to the graphical session: it only runs,
+# and can only be started, while someone is logged in to the Linux desktop.
+linux_tx() {
+    ssh -o ConnectTimeout=8 -o BatchMode=yes "$LINUX" "systemctl --user $1 $UNIT" >/dev/null 2>&1 || {
+        echo "${c_bad}could not $1 the linux sender${c_off}"; return 1; }
+    echo "linux sender: $(linux_q "$UNIT")"
+}
+
+linux_status() {
+    printf 'receiver  '
+    pid=$(lx_pid) || true
+    if [ -n "${pid:-}" ]; then printf '%srunning%s  pid %s, port %s\n' "$c_ok" "$c_off" "$pid" "$LINUX_PORT"
+    else printf '%sstopped%s\n' "$c_bad" "$c_off"; fi
+    printf 'sender    '
+    case "$(linux_q "$UNIT")" in
+        active) printf '%srunning%s  %s\n' "$c_ok" "$c_off" "$LINUX" ;;
+        "")     printf '%sunreachable%s (%s)\n' "$c_bad" "$c_off" "$LINUX" ;;
+        *)      printf '%sstopped%s  %s\n' "$c_bad" "$c_off" "$LINUX" ;;
+    esac
+    printf 'audio     '
+    if [ -n "${pid:-}" ] && flow "$LINUX_LOG"; then printf '%sflowing%s\n' "$c_ok" "$c_off"
+    else printf '%sno packets%s\n' "$c_bad" "$c_off"; fi
+    printf '%s%s%s\n' "$c_dim" "$(tail -1 "$LINUX_LOG" 2>/dev/null)" "$c_off"
+}
+
 # ---- norns link: same receiver program, its own port and log
 
 nx_pid() { pgrep -f "$NX_MATCH" 2>/dev/null | head -1; }
 
 nx_start() {
+    start_gate
     if [ -n "$(nx_pid)" ]; then echo "norns receiver already running (pid $(nx_pid))"; return 0; fi
     mkdir -p "$(dirname "$NORNS_LOG")"
     py=$(rx_python)
@@ -262,17 +364,7 @@ norns_status() {
     else printf '%soff%s\n' "$c_dim" "$c_off"; fi
 }
 
-# systemctl --user on the Linux host. Prints the unit state (active, inactive,
-# failed, ...) or nothing when the host is unreachable.
-linux_q() {
-    ssh -o ConnectTimeout=8 -o BatchMode=yes "$LINUX" "systemctl --user is-active $1" \
-        2>/dev/null | tail -1
-}
-
-# The Linux host owns the display when its graphical session is active.
-linux_has_session() { [ "$(linux_q graphical-session.target)" = active ]; }
-
-# Number of sender pipelines on the Windows VM. More than one means several
+# Number of sender pipelines on the Windows PC. More than one means several
 # RTP streams are arriving on the same port with independent sequence numbers,
 # which the receiver scores as enormous packet loss. Ending the scheduled task
 # does not kill processes it already started, so orphans accumulate silently.
@@ -283,16 +375,10 @@ win_count() {
 }
 
 tx_start() {
-    if linux_has_session; then
-        ssh -o ConnectTimeout=8 -o BatchMode=yes "$LINUX" "systemctl --user start $UNIT" \
-            >/dev/null 2>&1 || { echo "${c_bad}could not start linux sender${c_off}"; return 1; }
-        sleep 3
-        if [ "$(linux_q "$UNIT")" = active ]; then echo "sender started (linux)"
-        else echo "${c_bad}linux sender did not come up${c_off}"; return 1; fi
-        return 0
-    fi
-    ssh -o ConnectTimeout=8 "$WIN" "schtasks /run /tn $TASK" >/dev/null 2>&1 || {
-        echo "${c_bad}could not start sender${c_off}"; return 1; }
+    # Enable first: tx_stop disables the task so its every-minute trigger stays quiet.
+    ssh -o ConnectTimeout=8 "$WIN" \
+        "powershell -NoProfile -Command \"Enable-ScheduledTask -TaskName $TASK | Out-Null\" && schtasks /run /tn $TASK" \
+        >/dev/null 2>&1 || { echo "${c_bad}could not start sender${c_off}"; return 1; }
     sleep 6
     n=$(win_count)
     case "${n:-0}" in
@@ -303,17 +389,15 @@ tx_start() {
 }
 
 tx_stop() {
-    if linux_has_session; then
-        ssh -o ConnectTimeout=8 -o BatchMode=yes "$LINUX" "systemctl --user stop $UNIT" \
-            >/dev/null 2>&1 || true
-        if [ "$(linux_q "$UNIT")" = active ]; then echo "${c_bad}linux sender still running${c_off}"
-        else echo "sender stopped (linux)"; fi
-        return 0
-    fi
-    ssh -o ConnectTimeout=8 "$WIN" "schtasks /end /tn $TASK" >/dev/null 2>&1 || true
-    # Ending the task leaves its children behind; kill them explicitly.
+    # Disable, then end: the task also has a one-minute watchdog trigger, which
+    # would otherwise start the sender again within a minute. tx_start enables it.
     ssh -o ConnectTimeout=8 "$WIN" \
-        'powershell -NoProfile -Command "Stop-Process -Name gst-launch-1.0,pythonw -Force -ErrorAction SilentlyContinue"' \
+        "powershell -NoProfile -Command \"Disable-ScheduledTask -TaskName $TASK | Out-Null\" & schtasks /end /tn $TASK" \
+        >/dev/null 2>&1 || true
+    # Ending the task leaves its children behind; kill them explicitly. Only pcmlink's own
+    # pythonw: other programs on the PC run as pythonw too (its LG TV watcher does).
+    ssh -o ConnectTimeout=8 "$WIN" \
+        'powershell -NoProfile -Command "Stop-Process -Name gst-launch-1.0 -Force -ErrorAction SilentlyContinue; Get-CimInstance Win32_Process | Where-Object { $_.Name -eq \"pythonw.exe\" -and $_.CommandLine -match \"pcmlink\" } | Invoke-CimMethod -MethodName Terminate | Out-Null"' \
         >/dev/null 2>&1 || true
     sleep 2
     n=$(win_count)
@@ -334,17 +418,6 @@ flow() {
 }
 
 tx_status() {
-    session=$(linux_q graphical-session.target)
-    if [ "$session" = active ]; then
-        case "$(linux_q "$UNIT")" in
-            active) printf '%srunning%s  linux (%s)\n' "$c_ok" "$c_off" "$LINUX" ;;
-            *)      printf '%sstopped%s  linux (%s) has the desktop session\n' "$c_bad" "$c_off" "$LINUX" ;;
-        esac
-        return 0
-    fi
-    if [ -z "$session" ]; then
-        printf '%slinux unreachable%s (%s), ' "$c_dim" "$c_off" "$LINUX"
-    fi
     n=$(win_count)
     case "${n:-}" in
         1)  printf '%srunning%s  windows (%s)\n' "$c_ok" "$c_off" "$WIN" ;;
@@ -399,15 +472,18 @@ status() {
         printf '%sincreasing%s (+%s in 2s)\n' "$c_bad" "$c_off" "$((lb - la))"
     fi
 
+    # Packet counters only see the network. The audio sink logs each time it
+    # skips or pads the output to stay in sync (drift, late data): audible.
+    printf 'output    '
+    n=$(awk '/receive: running/ { n = 0 } /correct clock skew|resyncing/ { n++ } END { print n + 0 }' "$LOG" 2>/dev/null)
+    if [ "${n:-0}" = "0" ]; then printf '%sclean%s (no corrections since start)\n' "$c_ok" "$c_off"
+    else printf '%s%s corrections%s since start (clock skew or resync, see log)\n' "$c_bad" "$n" "$c_off"; fi
+
     printf '%s%s%s\n' "$c_dim" "$(tail -1 "$LOG" 2>/dev/null)" "$c_off"
 }
 
 sender_logs() {
-    if linux_has_session; then
-        ssh -t "$LINUX" "journalctl --user -u $UNIT -n 30 -f"
-    else
-        ssh "$WIN" 'powershell -NoProfile -c "Get-Content \"$env:LOCALAPPDATA\pcmlink\send.log\" -Tail 30 -Wait"'
-    fi
+    ssh "$WIN" 'powershell -NoProfile -c "Get-Content \"$env:LOCALAPPDATA\pcmlink\send.log\" -Tail 30 -Wait"'
 }
 
 case "${1:-status}" in
@@ -421,6 +497,13 @@ case "${1:-status}" in
     stop-rx)  rx_stop ;;
     logs)     tail -f "$LOG" ;;
     sender-logs) sender_logs ;;
+    linux)         linux_status ;;
+    start-linux)   lx_start; linux_tx start ;;
+    start-linux-rx) lx_start ;;
+    stop-linux)    linux_tx stop; lx_stop ;;
+    restart-linux) linux_tx stop; lx_stop; sleep 1; lx_start; linux_tx start; sleep 3; echo; linux_status ;;
+    linux-logs)    tail -f "$LINUX_LOG" ;;
+    linux-sender-logs) ssh -t "$LINUX" "journalctl --user -u $UNIT -n 30 -f" ;;
     norns)         norns_status ;;
     start-norns)   nx_start; norns_tx start ;;
     start-norns-rx) nx_start ;;
@@ -439,9 +522,17 @@ usage: pcmlink-ctl [command]
   restart-rx    receiver only (this Mac)
   start-rx      receiver only, and only if it is not running; safe to call at login
   stop-rx       receiver only
-  restart-tx    sender only (Linux host if it has the desktop session, else Windows VM)
+  restart-tx    sender only (the Windows PC)
   logs          follow the receiver log
-  sender-logs   follow the active sender's log over ssh
+  sender-logs   follow the Windows sender's log over ssh
+
+  linux           status of the Linux link (port $LINUX_PORT)
+  start-linux     Linux receiver here, then the sender on the Linux host
+  start-linux-rx  Linux receiver only, and only if not running; safe at login
+  stop-linux      both ends of the Linux link
+  restart-linux   both ends of the Linux link, then show status
+  linux-logs      follow the Linux receiver log
+  linux-sender-logs  follow the Linux sender's journal over ssh
 
   norns           status of the norns link (port $NORNS_PORT)
   start-norns     norns receiver here, then the sender on the norns
@@ -458,7 +549,9 @@ environment:
   PCMLINK_CTL_DEVICE      output device substring             (default: Babyface)
   PCMLINK_CTL_VOLUME      software gain                       (default: 1.0)
   PCMLINK_CTL_LINUX_HOST  ssh host alias of the Linux sender  (default: pc)
-  PCMLINK_CTL_WIN_HOST    ssh host alias of the Windows VM    (default: win11)
+  PCMLINK_CTL_LINUX_PORT  UDP port of the Linux link          (default: 5010)
+  PCMLINK_CTL_LINUX_LOG   Linux receiver log path
+  PCMLINK_CTL_WIN_HOST    ssh host alias of the Windows PC    (default: winpc)
   PCMLINK_CTL_LOG         receiver log path
   PCMLINK_CTL_PYTHON      interpreter to run the receiver     (default: first python3[.N] with gi)
   PCMLINK_CTL_NORNS_HOST  ssh host alias of the norns         (default: norns)

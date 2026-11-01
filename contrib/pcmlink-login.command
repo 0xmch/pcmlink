@@ -12,4 +12,4 @@
 ctl="$(dirname "$0")/pcmlink-ctl"
 log="$HOME/Library/Logs/pcmlink/login.log"
 mkdir -p "$(dirname "$log")"
-{ date; "$ctl" start-rx; "$ctl" start-norns-rx; } 2>&1 | tee -a "$log"
+{ date; "$ctl" start-rx; "$ctl" start-linux-rx; "$ctl" start-norns-rx; } 2>&1 | tee -a "$log"

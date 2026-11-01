@@ -18,6 +18,7 @@ import shlex
 import shutil
 import socket
 import subprocess
+import tempfile
 import sys
 import time
 from typing import NoReturn
@@ -61,6 +62,11 @@ DEFAULTS = {k: v for k, (v, _) in SETTINGS.items()}
 def die(msg: str, code: int = 1) -> NoReturn:
     print(f"{APP}: {msg}", file=sys.stderr)
     sys.exit(code)
+
+
+class Retry(Exception):
+    """A failure that can clear up by itself: a device not plugged in yet, a
+    pipeline that would not start. The run loop waits and tries again."""
 
 
 # ---------------------------------------------------------------- config
@@ -298,7 +304,9 @@ def build_receive(cfg: dict) -> str:
         f'caps="application/x-rtp,media=audio,encoding-name=L16,'
         f'clock-rate={cfg["rate"]},channels={cfg["channels"]},payload={cfg["payload"]}" '
         f"! rtpjitterbuffer name=jb latency={cfg['latency']} "
-        f"! rtpL16depay ! audioconvert ! audioresample "
+        # No audioresample: the stream already arrives at the rate fixed below,
+        # and conversion to the device's own rate happens in the output unit.
+        f"! rtpL16depay ! audioconvert "
         # Without this explicit format the sink may accept S16BE straight off the
         # wire and play byte-swapped samples, which sounds like loud static.
         f"! audio/x-raw,format={cfg['format']},rate={cfg['rate']},"
@@ -349,9 +357,9 @@ def find_device(substr: str, kind: str):
     hits = [d for d in devs if substr.lower() in (d.get_display_name() or "").lower()]
     if not hits:
         names = ", ".join(d.get_display_name() for d in devs) or "none"
-        die(f'no audio {kind.lower()} matching "{substr}". Available: {names}')
+        raise Retry(f'no audio {kind.lower()} matching "{substr}". Available: {names}')
     if len(hits) > 1:
-        die(f'"{substr}" is ambiguous: ' + ", ".join(d.get_display_name() for d in hits))
+        raise Retry(f'"{substr}" is ambiguous: ' + ", ".join(d.get_display_name() for d in hits))
     return hits[0]
 
 
@@ -404,7 +412,7 @@ def preflight(role: str, cfg: dict, tone: bool) -> list[str]:
                 need += {"Windows": ["wasapi2src"],
                          "Linux": ["pulsesrc"]}.get(platform.system(), [])
         else:
-            need = common + ["udpsrc", "rtpjitterbuffer", "rtpL16depay"]
+            need = ["audioconvert", "capsfilter", "udpsrc", "rtpjitterbuffer", "rtpL16depay"]
             if cfg["jack"]:
                 need += ["jackaudiosink"]
             else:
@@ -434,22 +442,18 @@ def preflight(role: str, cfg: dict, tone: bool) -> list[str]:
             problems.append(f"cannot bind {cfg['bind']}:{cfg['port']} ({exc}); already running?")
         finally:
             sock.close()
-        if cfg["device"] and Gst is not None:
-            devs = _devices("Sink")
-            hits = [d for d in devs if cfg["device"].lower() in (d.get_display_name() or "").lower()]
-            if len(hits) != 1:
-                names = ", ".join(d.get_display_name() for d in devs) or "none"
-                problems.append(f'device "{cfg["device"]}" matched {len(hits)} sinks. Available: {names}')
+    # The output device is looked up on every start of the pipeline instead
+    # (find_device): it may simply not be plugged in yet, which is worth waiting for.
     return problems
 
 
 # ---------------------------------------------------------------- run
 
-def run_subprocess(desc: str, cfg: dict) -> int:
+def _subprocess_runner(cfg: dict):
+    """One pipeline attempt through gst-launch-1.0, for systems without bindings."""
     exe = find_gst_launch(cfg)
     if not exe:
         die("gst-launch-1.0 not found")
-    argv = [exe] + shlex.split(desc, posix=(platform.system() != "Windows"))
     print(f"{APP}: using {exe} (no Python bindings; statistics unavailable)", flush=True)
     # Inherit our own streams where they are real files. Under pythonw.exe there
     # are no valid standard handles at all, and a child that inherits them fails
@@ -459,62 +463,200 @@ def run_subprocess(desc: str, cfg: dict) -> int:
         out, err = sys.stdout, sys.stderr
     except Exception:
         out = err = subprocess.DEVNULL
+    windows = platform.system() == "Windows"
     # gst-launch-1.0.exe is a console application: without CREATE_NO_WINDOW,
     # Windows opens a console for it even when the parent is pythonw.exe and the
-    # scheduled task is marked hidden.
-    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if platform.system() == "Windows" else 0
-    try:
-        return subprocess.call(argv, stdout=out, stderr=err, creationflags=flags) if flags \
-            else subprocess.call(argv, stdout=out, stderr=err)
-    except KeyboardInterrupt:
-        return 0
+    # scheduled task is marked hidden. HIGH_PRIORITY_CLASS must be asked for:
+    # a child of a high-priority process starts at normal priority (see
+    # _raise_priority for why it matters).
+    flags = (subprocess.CREATE_NO_WINDOW | subprocess.HIGH_PRIORITY_CLASS) if windows else 0
+    job = _kill_on_close_job() if windows else None
+
+    def attempt(desc: str) -> int:
+        argv = [exe] + shlex.split(desc, posix=not windows)
+        try:
+            proc = subprocess.Popen(argv, stdout=out, stderr=err, creationflags=flags)
+        except OSError as exc:
+            raise Retry(f"could not start {exe}: {exc}") from exc
+        if job is not None:
+            job.adopt(proc.pid)
+        try:
+            return proc.wait()
+        except KeyboardInterrupt:
+            proc.kill()
+            raise
+
+    return attempt
 
 
-def run(desc: str, cfg: dict, role: str) -> int:
-    """Run the pipeline, restarting it in-process if it fails.
+def _raise_priority() -> None:
+    """Windows: run at high priority.
 
-    Retrying here rather than relying on an external supervisor keeps the
-    process in the session that started it. On macOS that matters: a process
-    launched by launchd is not visible to per-application volume tools such as
-    SoundSource, while one launched from the GUI session is, so respawning
-    must not mean being respawned by a daemon.
+    Task Scheduler starts tasks below normal priority. At that priority the
+    thread that drains WASAPI capture lost the CPU whenever the PC was busy, even
+    at 5-24 % total load: capture overflowed ("Can't record audio fast enough",
+    samples dropped) and packets left in bursts that emptied the receiver's
+    jitterbuffer, which is audible stutter. Done here rather than in the task
+    definition so that it holds however pcmlink is started.
+    """
+    import ctypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.GetCurrentProcess.restype = ctypes.c_void_p
+    k32.SetPriorityClass.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+    if not k32.SetPriorityClass(k32.GetCurrentProcess(), 0x80):  # HIGH_PRIORITY_CLASS
+        print(f"{APP}: could not raise priority (error {ctypes.get_last_error()})", flush=True)
+
+
+class _Job:
+    """A Windows job object that kills its processes when this process exits.
+
+    Without it, killing or ending the parent leaves gst-launch-1.0.exe running.
+    The next start then adds a second sender on the same port, and the receiver
+    scores two interleaved RTP streams as massive packet loss. The handle is
+    closed by the kernel however this process ends, so the children go with it.
+    """
+
+    def __init__(self, k32, handle):
+        self.k32, self.handle = k32, handle
+
+    def adopt(self, pid: int) -> None:
+        from ctypes import wintypes
+        proc = self.k32.OpenProcess(0x0101, False, pid)  # PROCESS_SET_QUOTA | TERMINATE
+        if not proc or not self.k32.AssignProcessToJobObject(self.handle, proc):
+            print(f"{APP}: could not tie pid {pid} to this process; "
+                  "it may outlive a restart", flush=True)
+        if proc:
+            self.k32.CloseHandle(wintypes.HANDLE(proc))
+
+
+def _kill_on_close_job() -> _Job | None:
+    import ctypes
+    from ctypes import wintypes
+
+    class Basic(ctypes.Structure):
+        _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64),
+                    ("PerJobUserTimeLimit", ctypes.c_int64),
+                    ("LimitFlags", wintypes.DWORD),
+                    ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t),
+                    ("ActiveProcessLimit", wintypes.DWORD),
+                    ("Affinity", ctypes.c_size_t),
+                    ("PriorityClass", wintypes.DWORD),
+                    ("SchedulingClass", wintypes.DWORD)]
+
+    class Extended(ctypes.Structure):
+        _fields_ = [("BasicLimitInformation", Basic),
+                    ("IoInfo", ctypes.c_uint64 * 6),
+                    ("ProcessMemoryLimit", ctypes.c_size_t),
+                    ("JobMemoryLimit", ctypes.c_size_t),
+                    ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                    ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateJobObjectW.restype = wintypes.HANDLE
+    k32.CreateJobObjectW.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
+    k32.SetInformationJobObject.argtypes = (wintypes.HANDLE, ctypes.c_int,
+                                            ctypes.c_void_p, wintypes.DWORD)
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    k32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+    k32.CloseHandle.argtypes = (wintypes.HANDLE,)
+
+    handle = k32.CreateJobObjectW(None, None)
+    info = Extended()
+    info.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    # 9 = JobObjectExtendedLimitInformation
+    if not handle or not k32.SetInformationJobObject(handle, 9, ctypes.byref(info),
+                                                     ctypes.sizeof(info)):
+        print(f"{APP}: no job object; gst-launch may outlive this process", flush=True)
+        return None
+    return _Job(k32, handle)
+
+
+def _with_retry(cfg: dict, attempt) -> int:
+    """Call attempt() again whenever it returns or raises Retry.
+
+    A live stream has no normal end, so every return is a failure: an error,
+    an end of stream from a vanished device, or a crashed gst-launch. Only
+    ctrl-c (KeyboardInterrupt) stops the loop. With retry off, the first
+    attempt's result is final.
+    """
+    while True:
+        try:
+            code = attempt()
+        except Retry as exc:
+            print(f"{APP}: {exc}", flush=True)
+            code = 1
+        if not cfg["retry"]:
+            return code
+        delay = max(1, int(cfg["retry_delay"]))
+        print(f"{APP}: pipeline stopped ({code}), restarting in {delay}s", flush=True)
+        time.sleep(delay)
+
+
+def run(cfg: dict, role: str, tone: bool) -> int:
+    """Run the pipeline, rebuilding and restarting it in-process after a failure.
+
+    The pipeline description is rebuilt on every attempt, so a device that was
+    unplugged or not there yet is looked up again. Retrying here rather than
+    relying on an external supervisor keeps the process in the session that
+    started it. On macOS that matters: a process launched by launchd is not
+    visible to per-application volume tools such as SoundSource, while one
+    launched from the GUI session is, so respawning must not mean being
+    respawned by a daemon.
     """
     Gst, GLib = gst(required=needs_bindings(cfg, role))
     if Gst is None:
-        return run_subprocess(desc, cfg)
-    while True:
-        code = _run_once(desc, cfg, role, Gst, GLib)
-        if code == 0 or not cfg["retry"]:
-            return code
-        delay = max(1, int(cfg["retry_delay"]))
-        print(f"{APP}: pipeline failed, retrying in {delay}s", flush=True)
-        try:
-            time.sleep(delay)
-        except KeyboardInterrupt:
-            return 0
+        once = _subprocess_runner(cfg)
+    else:
+        _log_output_corrections(Gst)
+        def once(desc):
+            return _run_once(desc, cfg, role, Gst, GLib)
+    try:
+        return _with_retry(cfg, lambda: once(describe(cfg, role, tone)))
+    except KeyboardInterrupt:
+        print("\nstopping", flush=True)
+        return 0
+
+
+def describe(cfg: dict, role: str, tone: bool) -> str:
+    return build_send(cfg, tone) if role == "send" else build_receive(cfg)
+
+
+def _log_output_corrections(Gst) -> None:
+    """Print the audio sink's timeline corrections to the log.
+
+    The packet counters only see the network. When the sender's clock and the
+    output device's clock drift apart, or data arrives too late, the sink
+    corrects by skipping or inserting audio, which is audible, and says so only
+    in GStreamer's debug log ("correct clock skew", "Unexpected discontinuity
+    ... resyncing"). Those messages are rare, so enabling warnings for this one
+    category costs nothing.
+    """
+    Gst.debug_set_colored(False)
+    Gst.debug_set_threshold_for_name("audiobasesink", Gst.DebugLevel.WARNING)
 
 
 def _run_once(desc: str, cfg: dict, role: str, Gst, GLib) -> int:
+    """Play the pipeline until it fails or ends; returns 1, as either is a failure."""
     try:
         pipeline = Gst.parse_launch(desc)
     except GLib.Error as exc:
-        die(f"could not build pipeline: {exc.message}")
+        raise Retry(f"could not build pipeline: {exc.message}") from exc
 
     jb = pipeline.get_by_name("jb")
-    st = {"t0": None, "p0": 0, "last": 0, "qos": 0, "warn": 0, "failed": False}
+    st = {"t0": None, "p0": 0, "last": 0, "at": time.monotonic(), "warn": 0}
     loop = GLib.MainLoop()
 
     def on_msg(_bus, msg):
-        if msg.type == Gst.MessageType.QOS:
-            st["qos"] += 1
-        elif msg.type == Gst.MessageType.WARNING:
+        if msg.type == Gst.MessageType.WARNING:
             st["warn"] += 1
             print(f"  !! WARNING {msg.parse_warning()[0].message}", flush=True)
         elif msg.type == Gst.MessageType.ERROR:
             print(f"  !! ERROR {msg.parse_error()[0].message}", flush=True)
-            st["failed"] = True
             loop.quit()
         elif msg.type == Gst.MessageType.EOS:
+            print("  !! end of stream", flush=True)
             loop.quit()
         return True
 
@@ -526,42 +668,45 @@ def _run_once(desc: str, cfg: dict, role: str, Gst, GLib) -> int:
         return 0
 
     def tick():
-        now = time.time()
         if jb is None:
-            print(f'{time.strftime("%H:%M:%S")}  sending  '
-                  f'qos={st["qos"]} warn={st["warn"]}', flush=True)
+            print(f'{time.strftime("%H:%M:%S")}  sending  warn={st["warn"]}', flush=True)
             return True
+        now = time.monotonic()
         s = jb.get_property("stats")
-        pushed = u64(s, "num-pushed")
+        pushed = u64(s, "num-pushed")  # packets out of the jitterbuffer
         # Start the average at the first packet, not at process start, so an
         # idle wait for the sender does not drag the long-run rate down.
         if st["t0"] is None and pushed > 0:
             st["t0"], st["p0"] = now, pushed
         dt = (now - st["t0"]) if st["t0"] else 0.0
         avg = (pushed - st["p0"]) / dt if dt > 1 else 0.0
+        # Per second of real elapsed time: the timer itself can fire late.
+        rate = round((pushed - st["last"]) / max(now - st["at"], 0.001))
         print(f'{time.strftime("%H:%M:%S")}  jb={jb.get_property("percent"):3d}%  '
-              f'pkt/s={pushed - st["last"]:4d}  avg={avg:7.2f}  '
+              f'pkt/s={rate:4d}  avg={avg:7.2f}  '
               f'lost={u64(s, "num-lost")} late={u64(s, "num-late")} '
-              f'dup={u64(s, "num-duplicates")} qos={st["qos"]} warn={st["warn"]}', flush=True)
-        st["last"] = pushed
+              f'dup={u64(s, "num-duplicates")} warn={st["warn"]}', flush=True)
+        st["last"], st["at"] = pushed, now
         return True
 
     bus = pipeline.get_bus()
     bus.add_signal_watch()
-    bus.connect("message", on_msg)
-    if pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
-        die("pipeline failed to start")
-    print(f"{APP} {role}: running (ctrl-c to stop)", flush=True)
-    if cfg["stats"]:
-        GLib.timeout_add_seconds(1, tick)
+    handler = bus.connect("message", on_msg)
+    ticker = GLib.timeout_add_seconds(1, tick) if cfg["stats"] else 0
     try:
+        if pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
+            raise Retry("pipeline failed to start")
+        print(f"{APP} {role}: running (ctrl-c to stop)", flush=True)
         loop.run()
-    except KeyboardInterrupt:
-        print("\nstopping", flush=True)
     finally:
+        # Each attempt removes what it added, or a retry would leave the old
+        # timer printing statistics for a dead pipeline next to the new one.
+        if ticker:
+            GLib.source_remove(ticker)
+        bus.disconnect(handler)
+        bus.remove_signal_watch()
         pipeline.set_state(Gst.State.NULL)
-    # Non-zero on failure so launchd/systemd/Task Scheduler restart us.
-    return 1 if st["failed"] else 0
+    return 1
 
 
 # ---------------------------------------------------------------- service
@@ -576,14 +721,15 @@ SERVICE_LABEL = "io.pcmlink"
 def _invocation() -> list[str]:
     """How to re-invoke this program from a service definition.
 
-    shutil.which() must be treated carefully on Windows: PATHEXT includes .PY
-    and the current directory is searched, so it happily returns this very
-    script and the service ends up invoking the source file as its own
-    program. Only accept a genuine console executable.
+    Windows always gets pythonw.exe plus this file. pip's pcmlink.exe is a
+    console launcher: it opens a terminal window when started in a desktop
+    session and puts two extra processes in front of the real one. Nor can
+    shutil.which() be trusted there: PATHEXT includes .PY and the current
+    directory is searched, so it can return this very script.
     """
     console = shutil.which(APP)
-    if (console and os.path.abspath(console) != os.path.abspath(__file__)
-            and (platform.system() != "Windows" or console.lower().endswith(".exe"))):
+    if (platform.system() != "Windows" and console
+            and os.path.abspath(console) != os.path.abspath(__file__)):
         return [console]
     exe = sys.executable
     if platform.system() == "Windows":
@@ -624,47 +770,6 @@ def service_install(role: str, extra: list[str], start: bool) -> int:
     if system == "Darwin":
         return _install_login_item(role, extra, start)
 
-    if system == "__disabled_launchd__":
-        path = _plist_path(role)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        args = "".join(f"    <string>{escape(a)}</string>\n" for a in argv)
-        with open(path, "w") as fh:
-            fh.write(
-                '<?xml version="1.0" encoding="UTF-8"?>\n'
-                '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
-                '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
-                '<plist version="1.0"><dict>\n'
-                f'  <key>Label</key><string>{SERVICE_LABEL}.{role}</string>\n'
-                f'  <key>ProgramArguments</key><array>\n{args}  </array>\n'
-                '  <key>RunAtLoad</key><true/>\n'
-                '  <key>KeepAlive</key><true/>\n'
-                '  <key>ProcessType</key><string>Interactive</string>\n'
-                # Pin the agent to the Aqua (GUI login) session. Without this,
-                # per-application audio tools such as SoundSource do not see the
-                # process and cannot apply their software volume to it.
-                '  <key>LimitLoadToSessionType</key><string>Aqua</string>\n'
-                f'  <key>StandardOutPath</key><string>{escape(log)}</string>\n'
-                f'  <key>StandardErrorPath</key><string>{escape(log)}</string>\n'
-                '</dict></plist>\n')
-        domain = f"gui/{os.getuid()}"
-        subprocess.run(["launchctl", "bootout", f"{domain}/{SERVICE_LABEL}.{role}"],
-                       capture_output=True)
-        # bootout is asynchronous: bootstrapping immediately afterwards can hit a
-        # service that is still unloading, so retry briefly before giving up.
-        for _ in range(10):
-            r = subprocess.run(["launchctl", "bootstrap", domain, path],
-                               capture_output=True, text=True)
-            if r.returncode == 0:
-                break
-            time.sleep(0.5)
-        else:
-            die(f"launchctl bootstrap failed: {r.stderr.strip() or r.returncode}")
-        if start:
-            subprocess.run(["launchctl", "kickstart", f"{domain}/{SERVICE_LABEL}.{role}"],
-                           capture_output=True)
-        print(f"installed {path}\nlogs: {log}")
-        return 0
-
     if system == "Linux":
         path = _unit_path(role)
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -702,27 +807,70 @@ def service_install(role: str, extra: list[str], start: bool) -> int:
         # --log is an option of pcmlink, not of the interpreter, so it must come
         # after the whole invocation prefix (python.exe plus the script path).
         argv = _invocation() + ["--log", log, role] + extra
-        cmd = " ".join(f'"{a}"' if " " in a else a for a in argv)
-        r = subprocess.run(
-            ["schtasks", "/create", "/tn", name, "/tr", cmd, "/sc", "onlogon",
-             "/rl", "limited", "/f"], capture_output=True, text=True)
+        args = " ".join(f'"{a}"' if " " in a else a for a in argv[1:])
+        # The SID, not DOMAIN\name: under OpenSSH %USERDOMAIN% is WORKGROUP,
+        # which does not resolve, and a renamed account keeps its SID.
+        r = subprocess.run(["whoami", "/user", "/fo", "csv", "/nh"],
+                           capture_output=True, text=True)
+        fields = [f.strip('"') for f in r.stdout.strip().split(",")]
+        if r.returncode != 0 or len(fields) != 2:
+            die(f"could not read the current user's SID: {(r.stderr or r.stdout).strip()}")
+        account, user = fields
+        # S4U runs the task as this user at boot, in session 0, without a stored
+        # password: no desktop, so nothing can open a window or be closed from
+        # the taskbar, and it runs before anyone logs on. WASAPI loopback works
+        # there. The program restarts its own pipeline (retry), so the one-minute
+        # time trigger is only a watchdog for the program itself being killed;
+        # IgnoreNew makes it a no-op while it runs. It is a separate trigger
+        # because a repetition on the boot trigger only starts once that has
+        # fired, i.e. not until the next boot after installing. Task
+        # Scheduler's own RestartOnFailure is not used: it ignores exit codes.
+        since = time.strftime("%Y-%m-%dT%H:%M:%S")
+        xml = f"""<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>{APP} {role}</Description></RegistrationInfo>
+  <Triggers>
+    <BootTrigger/>
+    <TimeTrigger>
+      <StartBoundary>{since}</StartBoundary>
+      <Repetition><Interval>PT1M</Interval></Repetition>
+    </TimeTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>{escape(user)}</UserId>
+      <LogonType>S4U</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Hidden>true</Hidden>
+  </Settings>
+  <Actions Context="Author">
+    <Exec><Command>{escape(argv[0])}</Command><Arguments>{escape(args)}</Arguments></Exec>
+  </Actions>
+</Task>
+"""
+        # Replacing a running task's definition leaves the old instance running.
+        subprocess.run(["schtasks", "/end", "/tn", name], capture_output=True)
+        with tempfile.NamedTemporaryFile("w", suffix=".xml", encoding="utf-16",
+                                         delete=False) as fh:
+            fh.write(xml)
+        try:
+            r = subprocess.run(["schtasks", "/create", "/tn", name, "/xml", fh.name, "/f"],
+                               capture_output=True, text=True)
+        finally:
+            os.remove(fh.name)
         if r.returncode != 0:
-            die(f"schtasks failed: {(r.stderr or r.stdout).strip()}")
-        # Restart-on-failure is not expressible via schtasks flags; set it on the
-        # registered task definition through the Schedule.Service COM object.
-        ps = (
-            f"$s=New-Object -ComObject Schedule.Service; $s.Connect(); "
-            f"$t=$s.GetFolder('\\').GetTask('{name}'); $d=$t.Definition; "
-            "$d.Settings.RestartCount=3; $d.Settings.RestartInterval='PT1M'; "
-            "$d.Settings.Hidden=$true; $d.Settings.ExecutionTimeLimit='PT0S'; "
-            "$d.Settings.DisallowStartIfOnBatteries=$false; "
-            "$d.Settings.StopIfGoingOnBatteries=$false; "
-            f"$s.GetFolder('\\').RegisterTaskDefinition('{name}',$d,4,$null,$null,3) | Out-Null"
-        )
-        subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True)
+            die(f"schtasks failed (needs an elevated prompt): {(r.stderr or r.stdout).strip()}")
         if start:
             subprocess.run(["schtasks", "/run", "/tn", name], capture_output=True)
-        print(f"registered scheduled task {name} (at logon, hidden, restarts on failure)")
+        print(f"registered scheduled task {name} "
+              f"(at boot as {account}, session 0, watchdog every minute)")
         return 0
     die(f"service management is not implemented for {system}")
 
@@ -840,6 +988,7 @@ def service_uninstall(role: str) -> int:
         subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
         print(f"removed {path}")
     elif system == "Windows":
+        subprocess.run(["schtasks", "/end", "/tn", f"{APP}-{role}"], capture_output=True)
         subprocess.run(["schtasks", "/delete", "/tn", f"{APP}-{role}", "/f"], capture_output=True)
         print(f"removed scheduled task {APP}-{role}")
     else:
@@ -971,14 +1120,18 @@ def main(argv=None) -> int:
             print(f"{APP}: preflight: {problem}", file=sys.stderr)
         return 2
 
-    desc = build_send(cfg, tone) if role == "send" else build_receive(cfg)
-
     if a.dry_run:
         print("config: " + (", ".join(used) if used else "defaults only"))
         print("preflight: ok")
-        print("pipeline:\n  " + desc)
+        try:
+            print("pipeline:\n  " + describe(cfg, role, tone))
+        except Retry as exc:
+            print(f"pipeline: not buildable now: {exc}")
+            return 2
         return 0
-    return run(desc, cfg, role)
+    if platform.system() == "Windows":
+        _raise_priority()
+    return run(cfg, role, tone)
 
 
 if __name__ == "__main__":
