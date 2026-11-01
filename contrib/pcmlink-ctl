@@ -55,6 +55,10 @@ VOLUME="${PCMLINK_CTL_VOLUME:-1.0}"
 # silence and restart it on the next sound (pcmlink-rx --gate). The Windows link
 # carries most listening and is not gated.
 GATE="${PCMLINK_CTL_GATE:-30}"
+# The Windows link's buffer floor, in ms (pcmlink-rx --margin-ms). Its packets
+# arrive with occasional hiccups past 10 ms, the receiver's default, which cost
+# about four dropouts an hour on 2026-11-01; 20 ms absorbs them.
+PC_MARGIN="${PCMLINK_CTL_PC_MARGIN:-20}"
 WIN="${PCMLINK_CTL_WIN_HOST:-winpc}"
 LINUX="${PCMLINK_CTL_LINUX_HOST:-pc}"
 LINUX_PORT="${PCMLINK_CTL_LINUX_PORT:-5010}"
@@ -143,7 +147,7 @@ rx_start() {
     # Detach completely: stdin from /dev/null and both outputs to the log, so
     # the child holds none of this script's file descriptors open. Without that
     # a caller waiting on our output blocks until the receiver itself exits.
-    ( nohup "$RX" --port "$PORT" --device "$DEVICE" --volume "$VOLUME" \
+    ( nohup "$RX" --port "$PORT" --device "$DEVICE" --volume "$VOLUME" --margin-ms "$PC_MARGIN" \
         </dev/null >>"$LOG" 2>&1 & ) >/dev/null 2>&1
     sleep 2
     if [ -n "$(rx_pid)" ]; then echo "receiver started (pid $(rx_pid))"

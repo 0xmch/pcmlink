@@ -54,7 +54,7 @@ SETTINGS: dict[str, tuple[object, str]] = {
     "tone_volume":  (0.05,     "test tone volume, 0.0 to 1.0"),
     "gst_launch":   ("",       "path to gst-launch-1.0 (blank = search PATH)"),
     "retry":        (True,     "rebuild and restart the pipeline after a failure"),
-    "retry_delay":  (5,        "seconds to wait before retrying"),
+    "retry_delay":  (1,        "seconds to wait before retrying"),
 }
 DEFAULTS = {k: v for k, (v, _) in SETTINGS.items()}
 
