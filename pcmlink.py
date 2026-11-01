@@ -776,6 +776,9 @@ def service_install(role: str, extra: list[str], start: bool) -> int:
     log = _log_path(role)
 
     if system == "Darwin":
+        if role == "agent":
+            die("no per-application audio backend on macOS; `pcmlink agent` still "
+                "reports this machine's name if you run it by hand")
         return _install_login_item(role, extra, start)
 
     if system == "Linux":
@@ -824,6 +827,8 @@ def service_install(role: str, extra: list[str], start: bool) -> int:
         if r.returncode != 0 or len(fields) != 2:
             die(f"could not read the current user's SID: {(r.stderr or r.stdout).strip()}")
         account, user = fields
+        if role == "agent":
+            return _install_agent_task(user, account, argv, args, extra, start)
         # S4U runs the task as this user at boot, in session 0, without a stored
         # password: no desktop, so nothing can open a window or be closed from
         # the taskbar, and it runs before anyone logs on. WASAPI loopback works
@@ -881,6 +886,83 @@ def service_install(role: str, extra: list[str], start: bool) -> int:
               f"(at boot as {account}, session 0, watchdog every minute)")
         return 0
     die(f"service management is not implemented for {system}")
+
+
+def _option_values(args: list[str], flag: str) -> list[str]:
+    return [args[i + 1] for i, a in enumerate(args[:-1]) if a == flag]
+
+
+def _install_agent_task(user: str, account: str, argv: list[str], args: str,
+                        extra: list[str], start: bool) -> int:
+    """The agent's scheduled task on Windows, and its way through the firewall.
+
+    Unlike the sender it must run in the logged-on desktop session: Windows lists
+    a session's applications only to that session, and a process in session 0 sees
+    neither them nor their audio. So: at logon, with the user's interactive token.
+    It is elevated to control the sender's task and see every program's name, and
+    pythonw gives it no window. The time trigger is the same watchdog as the
+    sender's; it only fires while someone is logged on.
+    """
+    from xml.sax.saxutils import escape
+    name = f"{APP}-agent"
+    since = time.strftime("%Y-%m-%dT%H:%M:%S")
+    xml = f"""<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>{APP} agent</Description></RegistrationInfo>
+  <Triggers>
+    <LogonTrigger><UserId>{escape(user)}</UserId></LogonTrigger>
+    <TimeTrigger>
+      <StartBoundary>{since}</StartBoundary>
+      <Repetition><Interval>PT1M</Interval></Repetition>
+    </TimeTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>{escape(user)}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Hidden>true</Hidden>
+  </Settings>
+  <Actions Context="Author">
+    <Exec><Command>{escape(argv[0])}</Command><Arguments>{escape(args)}</Arguments></Exec>
+  </Actions>
+</Task>
+"""
+    subprocess.run(["schtasks", "/end", "/tn", name], capture_output=True)
+    with tempfile.NamedTemporaryFile("w", suffix=".xml", encoding="utf-16", delete=False) as fh:
+        fh.write(xml)
+    try:
+        r = subprocess.run(["schtasks", "/create", "/tn", name, "/xml", fh.name, "/f"],
+                           capture_output=True, text=True)
+    finally:
+        os.remove(fh.name)
+    if r.returncode != 0:
+        die(f"schtasks failed (needs an elevated prompt): {(r.stderr or r.stdout).strip()}")
+
+    # The agent would otherwise get a firewall prompt nobody can answer: it has no
+    # window, and it may be the only thing awake at the screen.
+    import pcmlink_agent
+    ports = _option_values(extra, "--port") or [str(pcmlink_agent.PORT)]
+    remote = sorted(pcmlink_agent.resolve_hosts(_option_values(extra, "--allow"))) or ["LocalSubnet"]
+    subprocess.run(["netsh", "advfirewall", "firewall", "delete", "rule", f"name={name}"],
+                   capture_output=True)
+    r = subprocess.run(["netsh", "advfirewall", "firewall", "add", "rule", f"name={name}",
+                        "dir=in", "action=allow", "protocol=TCP", f"localport={ports[-1]}",
+                        f"remoteip={','.join(remote)}"], capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"could not add the firewall rule: {(r.stderr or r.stdout).strip()}")
+    if start:
+        subprocess.run(["schtasks", "/run", "/tn", name], capture_output=True)
+    print(f"registered scheduled task {name} (at logon as {account}, desktop session, "
+          f"watchdog every minute); firewall allows {','.join(remote)} on TCP {ports[-1]}")
+    return 0
 
 
 def _app_bundle_path() -> str:
@@ -998,6 +1080,9 @@ def service_uninstall(role: str) -> int:
     elif system == "Windows":
         subprocess.run(["schtasks", "/end", "/tn", f"{APP}-{role}"], capture_output=True)
         subprocess.run(["schtasks", "/delete", "/tn", f"{APP}-{role}", "/f"], capture_output=True)
+        if role == "agent":
+            subprocess.run(["netsh", "advfirewall", "firewall", "delete", "rule",
+                            f"name={APP}-{role}"], capture_output=True)
         print(f"removed scheduled task {APP}-{role}")
     else:
         die(f"service management is not implemented for {system}")
@@ -1069,6 +1154,15 @@ def main(argv=None) -> int:
     rp.add_argument("--format", help=SETTINGS["format"][1])
     rp.add_argument("--jack", help=SETTINGS["jack"][1])
 
+    ap = sub.add_parser("agent", help="tell mixers which applications are playing here")
+    ap.add_argument("--port", type=int, default=None, help="TCP port (default 5003)")
+    ap.add_argument("--allow", action="append", default=[], metavar="HOST",
+                    help="accept mixers from this address, as well as this machine "
+                         "(repeatable; default: the receiver in [send] host)")
+    ap.add_argument("--hide", action="append", default=[], metavar="NAME",
+                    help="leave out this program, by exe or display name: for programs "
+                         "that capture the mix rather than play (repeatable)")
+
     dp = sub.add_parser("devices", help="list audio devices")
     dp.add_argument("--kind", choices=["Sink", "Source"], default="Sink")
 
@@ -1078,7 +1172,7 @@ def main(argv=None) -> int:
     vp = sub.add_parser("service",
                         help="install, remove or inspect the background service")
     vp.add_argument("action", choices=["install", "uninstall", "status"])
-    vp.add_argument("role", choices=["send", "receive"])
+    vp.add_argument("role", choices=["send", "receive", "agent"])
     vp.add_argument("--no-start", dest="start", action="store_false", default=True,
                     help="install without starting it now")
     vp.add_argument("args", nargs=argparse.REMAINDER,
@@ -1117,6 +1211,14 @@ def main(argv=None) -> int:
             marker = "" if eff[key] == DEFAULTS[key] else "  <- overridden"
             print(f"  {key:14} {eff[key]!r}{marker}")
         return 0
+
+    if a.cmd == "agent":
+        import pcmlink_agent
+        allow = a.allow
+        if not allow:
+            host = resolve(argparse.Namespace(), cfg_data, "send")["host"]
+            allow = [host] if host else []
+        return pcmlink_agent.main(a.port or pcmlink_agent.PORT, allow, a.hide)
 
     role = a.cmd
     cfg = resolve(a, cfg_data, role)

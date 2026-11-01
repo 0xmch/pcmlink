@@ -23,4 +23,4 @@ dependencies = []
 pcmlink = "pcmlink:main"
 
 [tool.setuptools]
-py-modules = ["pcmlink"]
+py-modules = ["pcmlink", "pcmlink_agent"]
