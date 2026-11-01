@@ -1,0 +1,26 @@
+#!/bin/sh
+# Build pcmlink-rx and sign it with a stable identity.
+#
+# The macOS application firewall blocks incoming packets to programs it has not
+# been told to allow, and it recognises a program by its code signature. The
+# linker's ad-hoc signature changes with every build, so an allow rule would
+# stop matching after each rebuild. Signing with a real identity (Developer ID
+# or Apple Development) keeps the rule valid. PCMLINK_SIGN_IDENTITY picks one;
+# otherwise the first such identity in the keychain is used.
+#
+# Allow it once (needs an administrator):
+#   sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add <path to pcmlink-rx>
+#   sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp <path to pcmlink-rx>
+set -eu
+cd "$(dirname "$0")"
+cargo build --release
+bin=target/release/pcmlink-rx
+identity="${PCMLINK_SIGN_IDENTITY:-$(security find-identity -v -p codesigning |
+    awk -F'"' '/"(Developer ID Application|Apple Development): / { print $2; exit }')}"
+if [ -n "$identity" ]; then
+    codesign --force --sign "$identity" --identifier io.pcmlink.rx "$bin"
+    echo "signed $bin"
+else
+    echo "no signing identity found: $bin keeps an ad-hoc signature, so a firewall"
+    echo "rule allowing it stops matching after every rebuild"
+fi

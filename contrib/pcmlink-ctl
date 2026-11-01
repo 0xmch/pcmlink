@@ -5,17 +5,20 @@
 # sender on a host reachable over ssh. Written for macOS receivers; adjust the
 # log path elsewhere.
 #
-#   receiver (this Mac)      pcmlink.py receive  ->  RME Babyface
+#   receiver (this Mac)      pcmlink-rx --port 5004  ->  RME Babyface
 #   sender   (Windows PC)    scheduled task "pcmlink-send"
+#
+# The receivers are the native pcmlink-rx (rx/, build with
+# rx/build, which also signs it for the firewall; see that file).
 #
 # Two more, independent links carry a Linux box and a norns (monome) to the same
 # interface, so all three can play at once:
 #
-#   receiver (this Mac)      pcmlink.py receive --port 5010  ->  RME Babyface
+#   receiver (this Mac)      pcmlink-rx --port 5010  ->  RME Babyface
 #   sender   (Linux host)    systemd --user unit "pcmlink-send", bound to the
 #                            graphical session, sending to port 5010
 #
-#   receiver (this Mac)      pcmlink.py receive --port 5006  ->  RME Babyface
+#   receiver (this Mac)      pcmlink-rx --port 5006  ->  RME Babyface
 #   sender   (norns)         system unit "pcmlink-send", tapping JACK
 #                            crone:output_1/2 (the norns main mix)
 #
@@ -43,9 +46,15 @@
 
 set -eu
 
-DIR="${PCMLINK_DIR:-$HOME/projects/pcmlink}"
+DIR="${PCMLINK_DIR:-$HOME/Projects/pcmlink}"
+RX="${PCMLINK_RX:-$DIR/rx/target/release/pcmlink-rx}"
+PORT="${PCMLINK_CTL_PORT:-5004}"
 DEVICE="${PCMLINK_CTL_DEVICE:-Babyface}"
 VOLUME="${PCMLINK_CTL_VOLUME:-1.0}"
+# Links that are mostly silent stop their output after this many seconds of
+# silence and restart it on the next sound (pcmlink-rx --gate). The Windows link
+# carries most listening and is not gated.
+GATE="${PCMLINK_CTL_GATE:-30}"
 WIN="${PCMLINK_CTL_WIN_HOST:-winpc}"
 LINUX="${PCMLINK_CTL_LINUX_HOST:-pc}"
 LINUX_PORT="${PCMLINK_CTL_LINUX_PORT:-5010}"
@@ -65,37 +74,15 @@ UNIT=pcmlink-send.service
 
 c_ok=$(printf '\033[32m'); c_bad=$(printf '\033[31m'); c_dim=$(printf '\033[2m'); c_off=$(printf '\033[0m')
 
-# The receiver is the process whose argv[0] is a Python interpreter running
-# "pcmlink.py receive". Anchoring on argv[0] matters: a bare
-# `pgrep -f "pcmlink.py receive"` also matches any shell whose command line
-# merely contains that text (a script checking on the receiver, say). start-rx
-# then takes that shell for a running receiver and starts nothing, and pkill
-# kills the shell.
-#
-# The first argument tells the receivers apart: the Windows one is started as
-# "receive --device ...", the Linux and norns ones as "receive --port <port> ...".
-# Keep that order in rx_start, lx_start and nx_start, or each will see another.
-RX_MATCH='^[^ ]*[Pp]ython[^ ]* pcmlink\.py receive --device'
-LX_MATCH="^[^ ]*[Pp]ython[^ ]* pcmlink\.py receive --port $LINUX_PORT "
-NX_MATCH="^[^ ]*[Pp]ython[^ ]* pcmlink\.py receive --port $NORNS_PORT "
-
-# The interpreter for the receivers, which need PyGObject. Homebrew points
-# python3 at each new python@3.x as soon as it is installed, and pygobject3 can
-# lag behind: python3 became 3.15 while gi existed only for 3.14, and every
-# receiver start failed with "No module named 'gi'". So unless
-# PCMLINK_CTL_PYTHON names one, take the first python3 or python3.N on PATH
-# that can import gi.
-rx_python() {
-    if [ -n "$PY" ]; then echo "$PY"; return 0; fi
-    # A glob, not ls: under set -e the first directory without a python3.N
-    # would end the search. An unmatched pattern is left as is, which the grep
-    # drops.
-    for p in python3 $(IFS=:; for d in $PATH; do printf '%s\n' "$d"/python3.*; done | grep -E '/python3\.[0-9]+$'); do
-        if "$p" -c 'import gi' 2>/dev/null; then echo "$p"; return 0; fi
-    done
-    # None can; this one fails with pcmlink.py's own message in the log.
-    echo python3
-}
+# A receiver is the process whose argv[0] is pcmlink-rx and whose first
+# argument is its port. Anchoring on argv[0] matters: a bare
+# `pgrep -f "pcmlink-rx"` also matches any shell whose command line merely
+# contains that text (a script checking on the receiver, say). start-rx then
+# takes that shell for a running receiver and starts nothing, and pkill kills
+# the shell. Keep --port first in rx_start, lx_start and nx_start.
+RX_MATCH="^[^ ]*/pcmlink-rx --port $PORT "
+LX_MATCH="^[^ ]*/pcmlink-rx --port $LINUX_PORT "
+NX_MATCH="^[^ ]*/pcmlink-rx --port $NORNS_PORT "
 
 # ---- starting a receiver: after SoundSource has settled, one starter at a time
 #
@@ -139,6 +126,12 @@ start_gate() {
     trap 'rm -f "$START_LOCK"' EXIT
 }
 
+rx_built() {
+    [ -x "$RX" ] && return 0
+    echo "${c_bad}$RX is missing${c_off}: build it with $DIR/rx/build"
+    return 1
+}
+
 rx_pid() { pgrep -f "$RX_MATCH" 2>/dev/null | head -1; }
 rx_count() { pgrep -f "$RX_MATCH" 2>/dev/null | wc -l | tr -d ' '; }
 
@@ -146,11 +139,11 @@ rx_start() {
     start_gate
     if [ -n "$(rx_pid)" ]; then echo "receiver already running (pid $(rx_pid))"; return 0; fi
     mkdir -p "$(dirname "$LOG")"
-    py=$(rx_python)
+    rx_built || return 1
     # Detach completely: stdin from /dev/null and both outputs to the log, so
     # the child holds none of this script's file descriptors open. Without that
     # a caller waiting on our output blocks until the receiver itself exits.
-    ( cd "$DIR" && nohup "$py" pcmlink.py receive --device "$DEVICE" --volume "$VOLUME" \
+    ( nohup "$RX" --port "$PORT" --device "$DEVICE" --volume "$VOLUME" \
         </dev/null >>"$LOG" 2>&1 & ) >/dev/null 2>&1
     sleep 2
     if [ -n "$(rx_pid)" ]; then echo "receiver started (pid $(rx_pid))"
@@ -173,9 +166,9 @@ lx_start() {
     start_gate
     if [ -n "$(lx_pid)" ]; then echo "linux receiver already running (pid $(lx_pid))"; return 0; fi
     mkdir -p "$(dirname "$LINUX_LOG")"
-    py=$(rx_python)
-    ( cd "$DIR" && nohup "$py" pcmlink.py receive --port "$LINUX_PORT" --device "$DEVICE" \
-        --volume "$VOLUME" </dev/null >>"$LINUX_LOG" 2>&1 & ) >/dev/null 2>&1
+    rx_built || return 1
+    ( nohup "$RX" --port "$LINUX_PORT" --device "$DEVICE" --volume "$VOLUME" --gate "$GATE" \
+        </dev/null >>"$LINUX_LOG" 2>&1 & ) >/dev/null 2>&1
     sleep 2
     if [ -n "$(lx_pid)" ]; then echo "linux receiver started (pid $(lx_pid))"
     else echo "${c_bad}linux receiver failed to start${c_off}; see $LINUX_LOG"; return 1; fi
@@ -229,9 +222,9 @@ nx_start() {
     start_gate
     if [ -n "$(nx_pid)" ]; then echo "norns receiver already running (pid $(nx_pid))"; return 0; fi
     mkdir -p "$(dirname "$NORNS_LOG")"
-    py=$(rx_python)
-    ( cd "$DIR" && nohup "$py" pcmlink.py receive --port "$NORNS_PORT" --device "$DEVICE" \
-        --volume "$VOLUME" </dev/null >>"$NORNS_LOG" 2>&1 & ) >/dev/null 2>&1
+    rx_built || return 1
+    ( nohup "$RX" --port "$NORNS_PORT" --device "$DEVICE" --volume "$VOLUME" --gate "$GATE" \
+        </dev/null >>"$NORNS_LOG" 2>&1 & ) >/dev/null 2>&1
     sleep 2
     if [ -n "$(nx_pid)" ]; then echo "norns receiver started (pid $(nx_pid))"
     else echo "${c_bad}norns receiver failed to start${c_off}; see $NORNS_LOG"; return 1; fi
@@ -472,12 +465,13 @@ status() {
         printf '%sincreasing%s (+%s in 2s)\n' "$c_bad" "$c_off" "$((lb - la))"
     fi
 
-    # Packet counters only see the network. The audio sink logs each time it
-    # skips or pads the output to stay in sync (drift, late data): audible.
+    # Packet counters only see the network; under= counts the times the output
+    # itself ran dry while the stream kept coming (audible dropouts).
     printf 'output    '
-    n=$(awk '/receive: running/ { n = 0 } /correct clock skew|resyncing/ { n++ } END { print n + 0 }' "$LOG" 2>/dev/null)
-    if [ "${n:-0}" = "0" ]; then printf '%sclean%s (no corrections since start)\n' "$c_ok" "$c_off"
-    else printf '%s%s corrections%s since start (clock skew or resync, see log)\n' "$c_bad" "$n" "$c_off"; fi
+    n=$(tail -1 "$LOG" 2>/dev/null | grep -oE 'under=[0-9]+' | cut -d= -f2)
+    if [ -z "${n:-}" ]; then printf '%sunknown%s\n' "$c_dim" "$c_off"
+    elif [ "$n" = "0" ]; then printf '%sclean%s (no dropouts since start)\n' "$c_ok" "$c_off"
+    else printf '%s%s dropouts%s since start\n' "$c_bad" "$n" "$c_off"; fi
 
     printf '%s%s%s\n' "$c_dim" "$(tail -1 "$LOG" 2>/dev/null)" "$c_off"
 }

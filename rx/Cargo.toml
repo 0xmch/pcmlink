@@ -1,0 +1,20 @@
+[package]
+name = "pcmlink-rx"
+version = "0.1.0"
+edition = "2021"
+description = "Native macOS receiver for pcmlink: RTP L16 over UDP to a CoreAudio device"
+license = "MIT"
+publish = false
+
+[dependencies]
+coreaudio-rs = "0.14.2"
+libc = "0.2.191"
+rtrb = "0.4.1"
+rubato = { version = "5.0.1", default-features = false }
+objc2-audio-toolbox = { version = "0.3.2", default-features = false, features = ["std", "AUComponent", "AudioComponent", "AudioUnitProperties"] }
+objc2-core-audio = { version = "0.3.2", default-features = false, features = ["std", "AudioHardware", "objc2-core-audio-types"] }
+objc2-core-audio-types = { version = "0.3.2", default-features = false, features = ["std", "CoreAudioBaseTypes"] }
+
+[profile.release]
+lto = true
+codegen-units = 1

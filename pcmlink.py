@@ -633,6 +633,8 @@ def _log_output_corrections(Gst) -> None:
     ... resyncing"). Those messages are rare, so enabling warnings for this one
     category costs nothing.
     """
+    if "GST_DEBUG" in os.environ:  # explicit debugging settings win
+        return
     Gst.debug_set_colored(False)
     Gst.debug_set_threshold_for_name("audiobasesink", Gst.DebugLevel.WARNING)
 

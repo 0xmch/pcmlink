@@ -270,6 +270,38 @@ swiftc -O contrib/systap/systap.swift -o contrib/systap/systap
 pcmlink-ctl start-norns-in      # and stop-norns-in
 ```
 
+## Native receiver for macOS (rx/)
+
+`rx/` is `pcmlink-rx`, a receiver for macOS written in Rust. It speaks the same
+stream, so senders do not change, and `pcmlink-ctl` starts it for all three
+links. Compared with `pcmlink.py receive` it:
+
+- converts to the device's rate and corrects clock drift in one smooth
+  resampler, steered so the buffer's lowest point each second sits at a small
+  margin (`--margin-ms`, 10 ms). Latency adapts to how bursty the sender is,
+  and drift never makes the output skip or pad, which GStreamer's sink does;
+- plays on the device's stereo pair (Audio MIDI Setup > Configure Speakers),
+  on that device even when the default output changes;
+- stops the output after `--idle` seconds without packets (10), and with
+  `--gate N` also after N seconds of silence, restarting it on the first sound.
+  A stopped output does no I/O at all, so CoreAudio and SoundSource can idle.
+  The audio that arrives while the device starts is kept and played;
+- counts what the packet counters cannot see: `gap=` (audio the sender never
+  sent, filled with silence) and `under=` (the output running dry while the
+  stream kept coming);
+- rebuilds itself when the device goes away or changes rate.
+
+Build it with `rx/build`, which also signs it: the macOS firewall must allow
+it to receive from other machines, once, and recognises it by its signature
+(see the comments in `rx/build`).
+
+```
+15:04:12  buf=21.6/ 9.9ms  pkt/s= 200  avg= 200.01  lost=0 late=0 dup=0 gap=0ms under=0 drift=+12ppm out=on
+```
+
+`buf` is the buffer's average and lowest level over the last second, and
+`drift` the correction the resampler currently applies.
+
 ## Volume
 
 `--volume` applies a software gain: `1.0` is unity, `0.5` is roughly −6 dB,
