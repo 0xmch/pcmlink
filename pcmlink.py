@@ -278,6 +278,12 @@ def build_send(cfg: dict, tone: bool) -> str:
         f"! audioconvert "
         f"! audio/x-raw,format=S16BE,rate={cfg['rate']},"
         f"channels={cfg['channels']},layout=interleaved "
+        # Capture can stop without an error: after the PC slept, WASAPI loopback
+        # delivered nothing while gst-launch kept running, so the link stayed
+        # silent until restarted by hand. Every source here delivers audio
+        # continuously, silence included, so three seconds without any is a
+        # stall: the watchdog fails the pipeline and the run loop rebuilds it.
+        f"! watchdog timeout=3000 "
         f"! rtpL16pay pt={cfg['payload']} mtu={cfg['mtu']} "
         f"! udpsink host={cfg['host']} port={cfg['port']} sync=false async=false"
     )
@@ -403,7 +409,7 @@ def preflight(role: str, cfg: dict, tone: bool) -> list[str]:
     if Gst is not None:
         common = ["audioconvert", "audioresample", "capsfilter"]
         if role == "send":
-            need = common + ["rtpL16pay", "udpsink"]
+            need = common + ["watchdog", "rtpL16pay", "udpsink"]
             if tone:
                 need += ["audiotestsrc"]
             elif cfg["jack"]:
