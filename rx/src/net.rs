@@ -23,6 +23,7 @@ use rubato::{
 };
 
 use crate::rtp::{self, Arrival, Tracker, SILENCE_PEAK};
+use crate::control::Live;
 use crate::{Ctl, Shared};
 
 /// Frames per resampler call: 2.5 ms at 48 kHz.
@@ -44,7 +45,6 @@ pub struct Config {
     pub stream_rate: u32,
     pub channels: usize,
     pub payload_type: u8,
-    pub gain: f32,
     pub device_rate: f64,
     /// Frames (device rate) the buffer's low point should keep in reserve, and
     /// the ring's capacity in samples.
@@ -62,9 +62,12 @@ pub fn run(
     socket: UdpSocket,
     mut ring: rtrb::Producer<f32>,
     shared: Arc<Shared>,
+    live: Arc<Live>,
     ctl: Sender<Ctl>,
 ) -> Result<(), String> {
     let ch = cfg.channels;
+    let mut gain = live.target_gain();
+    let mut peer = None;
     let params = SincInterpolationParameters {
         sinc_len: 128,
         f_cutoff: None,
@@ -101,8 +104,8 @@ pub fn run(
     };
 
     while !shared.stop.load(Relaxed) {
-        let len = match socket.recv(&mut packet) {
-            Ok(len) => len,
+        let (len, from) = match socket.recv_from(&mut packet) {
+            Ok(received) => received,
             Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
                 // No packets at all is silence too.
                 if !idle && quiet(last_sound, last_packet) {
@@ -123,6 +126,9 @@ pub fn run(
         }
         let frames = (p.payload.len() / (2 * ch)) as u32;
         shared.packets.fetch_add(1, Relaxed);
+        if peer != Some(from) && live.set_peer(from) {
+            peer = Some(from);
+        }
         let now = crate::now_ms();
         let previous = shared.last_packet_ms.swap(now, Relaxed);
         // The output ran dry since the last packet. If the stream kept coming
@@ -156,7 +162,9 @@ pub fn run(
         // there is no silence gate). It is buffered below before the device
         // starts reading, so it is played, not skipped.
         last_packet = Instant::now();
-        let loud = rtp::peak(p.payload) > SILENCE_PEAK;
+        let levels = rtp::levels(p.payload);
+        live.meter(&levels, frames);
+        let loud = levels.peak[0].max(levels.peak[1]) > SILENCE_PEAK;
         if loud {
             last_sound = last_packet;
         }
@@ -178,7 +186,9 @@ pub fn run(
         }
 
         staging.resize(staging.len() + gap * ch, 0.0); // silence where audio was lost
-        rtp::decode_into(p.payload, cfg.gain, &mut staging);
+        let target = live.target_gain();
+        rtp::decode_into(p.payload, gain, target, ch, &mut staging);
+        gain = target;
 
         let mut used = 0;
         while staging.len() - used >= CHUNK * ch {

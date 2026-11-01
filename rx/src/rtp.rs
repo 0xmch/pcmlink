@@ -39,18 +39,46 @@ pub fn parse(b: &[u8]) -> Option<Packet<'_>> {
 }
 
 /// Largest sample magnitude in an L16 payload (16-bit big-endian samples).
+#[cfg(test)]
 pub fn peak(payload: &[u8]) -> u16 {
-    payload
-        .as_chunks::<2>().0.iter()
-        .map(|s| i16::from_be_bytes([s[0], s[1]]).unsigned_abs())
-        .max()
-        .unwrap_or(0)
+    let levels = levels(payload);
+    levels.peak[0].max(levels.peak[1])
 }
 
-/// Append the payload's samples as f32, multiplied by `gain`.
-pub fn decode_into(payload: &[u8], gain: f32, out: &mut Vec<f32>) {
-    let scale = gain / 32768.0;
-    out.extend(payload.as_chunks::<2>().0.iter().map(|s| i16::from_be_bytes([s[0], s[1]]) as f32 * scale));
+/// One packet's level per channel of a stereo stream: the same pass decides the
+/// silence gate and feeds the meters.
+#[derive(Default)]
+pub struct Levels {
+    pub peak: [u16; 2],
+    /// Sum of the squared samples.
+    pub energy: [u64; 2],
+}
+
+pub fn levels(payload: &[u8]) -> Levels {
+    let mut out = Levels::default();
+    for (i, s) in payload.as_chunks::<2>().0.iter().enumerate() {
+        let v = i16::from_be_bytes([s[0], s[1]]).unsigned_abs();
+        let c = i & 1;
+        out.peak[c] = out.peak[c].max(v);
+        out.energy[c] += (v as u64) * (v as u64);
+    }
+    out
+}
+
+/// Append the payload's samples as f32, moving the gain linearly from `from` to
+/// `to` across the packet, so a fader or mute change does not click.
+pub fn decode_into(payload: &[u8], from: f32, to: f32, channels: usize, out: &mut Vec<f32>) {
+    let samples = payload.as_chunks::<2>().0;
+    if from == to {
+        let scale = to / 32768.0;
+        out.extend(samples.iter().map(|s| i16::from_be_bytes([s[0], s[1]]) as f32 * scale));
+        return;
+    }
+    let frames = (samples.len() / channels).max(1) as f32;
+    out.extend(samples.iter().enumerate().map(|(i, s)| {
+        let gain = from + (to - from) * ((i / channels) as f32 + 1.0) / frames;
+        i16::from_be_bytes([s[0], s[1]]) as f32 / 32768.0 * gain
+    }));
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -158,8 +186,23 @@ mod tests {
     #[test]
     fn decodes_big_endian_with_gain() {
         let mut out = Vec::new();
-        decode_into(&rtp(0, 0, 0, &[16384, -32768])[12..], 0.5, &mut out);
+        decode_into(&rtp(0, 0, 0, &[16384, -32768])[12..], 0.5, 0.5, 2, &mut out);
         assert_eq!(out, vec![0.25, -0.5]);
+    }
+
+    #[test]
+    fn a_gain_change_ramps_across_the_packet_and_ends_on_target() {
+        let mut out = Vec::new();
+        // Four stereo frames at -6 dBFS, fading from unity to silence.
+        decode_into(&rtp(0, 0, 0, &[16384; 8])[12..], 1.0, 0.0, 2, &mut out);
+        assert_eq!(out, vec![0.375, 0.375, 0.25, 0.25, 0.125, 0.125, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn levels_are_per_channel() {
+        let l = levels(&rtp(0, 0, 0, &[100, -200, -50, 20])[12..]);
+        assert_eq!(l.peak, [100, 200]);
+        assert_eq!(l.energy, [100 * 100 + 50 * 50, 200 * 200 + 20 * 20]);
     }
 
     #[test]

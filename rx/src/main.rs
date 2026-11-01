@@ -6,7 +6,11 @@
 //! - CoreAudio's real-time callback: copy from the ring to the device (output.rs);
 //! - main: start and stop the output for the silence gate, print statistics,
 //!   and rebuild everything if the device goes away or changes rate.
+//!
+//! A fourth, the control thread (control.rs), serves mixers. It only reads and
+//! writes atomics the network thread looks at, so it cannot delay the audio.
 
+mod control;
 mod net;
 mod output;
 mod rtp;
@@ -32,7 +36,10 @@ const USAGE: &str = "usage: pcmlink-rx [--port 5004] [--bind 0.0.0.0] [--device 
   --margin-ms  audio the buffer keeps in reserve at its lowest point; latency adapts
                to the sender's bursts on top of this
   --io-frames  ask the device for this I/O block size (default: leave it to CoreAudio;
-               a small value makes every client of the device cycle faster)";
+               a small value makes every client of the device cycle faster)
+
+A mixer (pcmlink-mixer) finds this receiver through its control socket, in
+~/Library/Application Support/pcmlink/rx/ or $PCMLINK_RX_DIR.";
 
 /// Counters and state shared by the three threads.
 #[derive(Default)]
@@ -62,6 +69,8 @@ pub struct Shared {
     pub drift_ppm: AtomicI32,
     /// The output is running and past its priming.
     pub playing: AtomicBool,
+    /// The output is started; false while the silence gate or idle timer has it stopped.
+    pub on: AtomicBool,
     pub stop: AtomicBool,
 }
 
@@ -178,24 +187,30 @@ fn main() {
         );
     }
     socket.set_read_timeout(Some(Duration::from_millis(100))).expect("socket timeout");
+    let live = Arc::new(control::Live::new(opts.volume));
+    control::spawn(opts.port, opts.margin_ms, opts.rate, live.clone());
 
     // Every failure (device unplugged or not there yet, rate changed, a broken
     // output unit) tears everything down and starts again. Only a signal ends it.
     loop {
-        if let Err(e) = run(&opts, &socket) {
+        if let Err(e) = run(&opts, &socket, &live) {
             println!("pcmlink: {e}; restarting in 2s");
+            live.set_error(Some(e));
             thread::sleep(Duration::from_secs(2));
         }
     }
 }
 
-fn run(opts: &Opts, socket: &UdpSocket) -> Result<(), String> {
+fn run(opts: &Opts, socket: &UdpSocket, live: &Arc<control::Live>) -> Result<(), String> {
     let dev = output::find(&opts.device)?;
     let channels = 2;
     let margin_frames = opts.margin_ms / 1000.0 * dev.rate;
     let ring_capacity = (dev.rate / 2.0) as usize * channels; // half a second
     let (producer, consumer) = rtrb::RingBuffer::new(ring_capacity);
     let shared = Arc::new(Shared::default());
+    shared.on.store(true, Relaxed);
+    live.set_current(shared.clone(), dev.name.clone(), dev.rate);
+    live.set_error(None);
     // Before playing, wait for three times the margin, enough to ride out one
     // sender burst plus one device block; the controller then
     // settles the level to what this sender's bursts need.
@@ -207,7 +222,6 @@ fn run(opts: &Opts, socket: &UdpSocket) -> Result<(), String> {
         stream_rate: opts.rate,
         channels,
         payload_type: opts.payload,
-        gain: opts.volume,
         device_rate: dev.rate,
         margin_frames,
         ring_capacity,
@@ -218,13 +232,14 @@ fn run(opts: &Opts, socket: &UdpSocket) -> Result<(), String> {
     au.start().map_err(|e| format!("cannot start the output: {e:?}"))?;
     let socket = socket.try_clone().map_err(|e| e.to_string())?;
     let net_shared = shared.clone();
+    let net_live = live.clone();
     let worker = thread::Builder::new()
         .name("net".into())
         .spawn(move || {
             unsafe {
                 libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
             }
-            net::run(config, socket, producer, net_shared, ctl)
+            net::run(config, socket, producer, net_shared, net_live, ctl)
         })
         .map_err(|e| e.to_string())?;
 
@@ -237,7 +252,7 @@ fn run(opts: &Opts, socket: &UdpSocket) -> Result<(), String> {
         opts.margin_ms,
         if opts.gate > 0 { format!(", gate {} s", opts.gate) } else { String::new() }
     );
-    let result = supervise(opts, &dev, &mut au, &shared, &events);
+    let result = supervise(opts, &dev, &mut au, &shared, live, &events);
     shared.stop.store(true, Relaxed);
     let _ = au.stop();
     drop(au);
@@ -250,6 +265,7 @@ fn supervise(
     dev: &output::Device,
     au: &mut coreaudio::audio_unit::AudioUnit,
     shared: &Shared,
+    live: &control::Live,
     events: &mpsc::Receiver<Ctl>,
 ) -> Result<(), String> {
     let mut on = true;
@@ -265,11 +281,13 @@ fn supervise(
                 let t = Instant::now();
                 au.start().map_err(|e| format!("cannot restart the output: {e:?}"))?;
                 on = true;
+                shared.on.store(true, Relaxed);
                 println!("{}  output on (started in {:.0} ms)", clock(), t.elapsed().as_secs_f64() * 1e3);
             }
             Ok(Ctl::Idle) if on => {
                 au.stop().map_err(|e| format!("cannot stop the output: {e:?}"))?;
                 on = false;
+                shared.on.store(false, Relaxed);
                 shared.playing.store(false, Relaxed);
                 println!("{}  output idle", clock());
             }
@@ -277,6 +295,11 @@ fn supervise(
             Err(RecvTimeoutError::Disconnected) => return Ok(()), // the network thread ended; run() reports why
             Err(RecvTimeoutError::Timeout) => {
                 next += Duration::from_secs(1);
+                // Ok, not Err: run() ends and main starts it again at once.
+                if live.take_reopen() {
+                    println!("{}  reopening the output (asked by a mixer)", clock());
+                    return Ok(());
+                }
                 if !output::is_alive(dev.id) {
                     return Err(format!("{} went away", dev.name));
                 }
