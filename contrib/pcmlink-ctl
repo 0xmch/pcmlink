@@ -62,6 +62,7 @@ PC_MARGIN="${PCMLINK_CTL_PC_MARGIN:-20}"
 WIN="${PCMLINK_CTL_WIN_HOST:-winpc}"
 LINUX="${PCMLINK_CTL_LINUX_HOST:-pc}"
 LINUX_PORT="${PCMLINK_CTL_LINUX_PORT:-5010}"
+RX_SOCKETS="${PCMLINK_RX_DIR:-$HOME/Library/Application Support/pcmlink/rx}"
 LINUX_LOG="${PCMLINK_CTL_LINUX_LOG:-$HOME/Library/Logs/pcmlink/receive-linux.log}"
 LOG="${PCMLINK_CTL_LOG:-$HOME/Library/Logs/pcmlink/receive.log}"
 PY="${PCMLINK_CTL_PYTHON:-}"
@@ -213,9 +214,9 @@ linux_status() {
         *)      printf '%sstopped%s  %s\n' "$c_bad" "$c_off" "$LINUX" ;;
     esac
     printf 'audio     '
-    if [ -n "${pid:-}" ] && flow "$LINUX_LOG"; then printf '%sflowing%s\n' "$c_ok" "$c_off"
+    if [ -n "${pid:-}" ] && flow "$LINUX_PORT"; then printf '%sflowing%s\n' "$c_ok" "$c_off"
     else printf '%sno packets%s\n' "$c_bad" "$c_off"; fi
-    printf '%s%s%s\n' "$c_dim" "$(tail -1 "$LINUX_LOG" 2>/dev/null)" "$c_off"
+    printf '%s%s%s\n' "$c_dim" "$(live_summary "$LINUX_PORT")" "$c_off"
 }
 
 # ---- norns link: same receiver program, its own port and log
@@ -353,9 +354,9 @@ norns_status() {
         *)      printf '%sstopped%s  %s\n' "$c_bad" "$c_off" "$NORNS" ;;
     esac
     printf 'audio     '
-    if [ -n "${pid:-}" ] && flow "$NORNS_LOG"; then printf '%sflowing%s\n' "$c_ok" "$c_off"
+    if [ -n "${pid:-}" ] && flow "$NORNS_PORT"; then printf '%sflowing%s\n' "$c_ok" "$c_off"
     else printf '%sno packets%s\n' "$c_bad" "$c_off"; fi
-    printf '%s%s%s\n' "$c_dim" "$(tail -1 "$NORNS_LOG" 2>/dev/null)" "$c_off"
+    printf '%s%s%s\n' "$c_dim" "$(live_summary "$NORNS_PORT")" "$c_off"
     printf 'input     '
     if [ -n "$(ni_pid)" ]; then printf '%sfeeding%s  this Mac -> norns input (port %s, gain %s)\n' "$c_ok" "$c_off" "$NI_PORT" "$NI_GAIN"
     else printf '%soff%s\n' "$c_dim" "$c_off"; fi
@@ -402,16 +403,37 @@ tx_stop() {
     else echo "${c_bad}sender still has $n process(es)${c_off}"; fi
 }
 
+# One status line from a receiver's control socket: what it is doing right now.
+# The logs are too sparse for that; they only record changes and a line a minute.
+rx_live() {
+    # -d: nc otherwise quits as soon as its stdin is closed, before reading anything.
+    nc -d -U "$RX_SOCKETS/$1.sock" </dev/null 2>/dev/null | head -1
+}
+
+# A number from such a line: live_field LINE lost
+live_field() {
+    printf '%s' "$1" | sed -nE "s/.*\"$2\":(-?[0-9.]+).*/\1/p"
+}
+
+# The same line in the form the log uses.
+live_summary() {
+    line=$(rx_live "$1")
+    [ -n "$line" ] || return 0
+    case "$line" in *'"on":true'*) out=on ;; *) out=idle ;; esac
+    printf 'buf=%s/%sms lost=%s late=%s dup=%s gap=%sms under=%s drift=%sppm out=%s\n' \
+        "$(live_field "$line" buf_ms)" "$(live_field "$line" low_ms)" "$(live_field "$line" lost)" \
+        "$(live_field "$line" late)" "$(live_field "$line" dup)" "$(live_field "$line" gap_ms)" \
+        "$(live_field "$line" under)" "$(live_field "$line" drift_ppm)" "$out"
+}
+
 flow() {
-    # Two samples a second apart: if the packet counter moves, audio is flowing.
-    log="${1:-$LOG}"
-    a=$(tail -1 "$log" 2>/dev/null)
+    # Two samples apart: if the packet counter moves, audio is flowing. That also
+    # means "receiver alive but sender silent" is not reported as flowing.
+    port="${1:-$PORT}"
+    a=$(live_field "$(rx_live "$port")" packets)
     sleep 2
-    b=$(tail -1 "$log" 2>/dev/null)
-    [ -n "$a" ] && [ "$a" != "$b" ] || return 1
-    # The line advances every second while running; require a non-zero rate too,
-    # so "receiver alive but sender silent" is not reported as flowing.
-    echo "$b" | grep -qE 'pkt/s= *[1-9]' || return 1
+    b=$(live_field "$(rx_live "$port")" packets)
+    [ -n "$a" ] && [ -n "$b" ] && [ "$a" != "$b" ]
 }
 
 tx_status() {
@@ -459,9 +481,9 @@ status() {
     else printf '%sno packets%s\n' "$c_bad" "$c_off"; fi
 
     printf 'loss      '
-    la=$(tail -1 "$LOG" 2>/dev/null | grep -oE 'lost=[0-9]+' | cut -d= -f2)
+    la=$(live_field "$(rx_live "$PORT")" lost)
     sleep 2
-    lb=$(tail -1 "$LOG" 2>/dev/null | grep -oE 'lost=[0-9]+' | cut -d= -f2)
+    lb=$(live_field "$(rx_live "$PORT")" lost)
     if [ -z "${la:-}" ]; then printf '%sunknown%s\n' "$c_dim" "$c_off"
     elif [ "$la" = "$lb" ]; then
         printf '%sstable%s (%s cumulative, not increasing)\n' "$c_ok" "$c_off" "$la"
@@ -472,12 +494,12 @@ status() {
     # Packet counters only see the network; under= counts the times the output
     # itself ran dry while the stream kept coming (audible dropouts).
     printf 'output    '
-    n=$(tail -1 "$LOG" 2>/dev/null | grep -oE 'under=[0-9]+' | cut -d= -f2)
+    n=$(live_field "$(rx_live "$PORT")" under)
     if [ -z "${n:-}" ]; then printf '%sunknown%s\n' "$c_dim" "$c_off"
     elif [ "$n" = "0" ]; then printf '%sclean%s (no dropouts since start)\n' "$c_ok" "$c_off"
     else printf '%s%s dropouts%s since start\n' "$c_bad" "$n" "$c_off"; fi
 
-    printf '%s%s%s\n' "$c_dim" "$(tail -1 "$LOG" 2>/dev/null)" "$c_off"
+    printf '%s%s%s\n' "$c_dim" "$(live_summary "$PORT")" "$c_off"
 }
 
 sender_logs() {

@@ -302,6 +302,11 @@ it to receive from other machines, once, and recognises it by its signature
 `buf` is the buffer's average and lowest level over the last second, and
 `drift` the correction the resampler currently applies.
 
+The log stays small. A line goes out when a loss or dropout counter changes, and
+otherwise once a minute while the output runs (`--stats-every`), and a log past
+20 MB trims itself to its newest half. Live numbers are on the control socket,
+which `pcmlink-mixer` and `pcmlink-ctl status` read.
+
 ## Mixer (mixer/)
 
 `pcmlink-mixer` is a terminal mixer in the spirit of alsamixer: one strip per

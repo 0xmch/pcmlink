@@ -24,6 +24,7 @@ import time
 from typing import NoReturn
 
 APP = "pcmlink"
+LOG_LIMIT = 20 * 1024 * 1024  # per log file
 CONFIG_BASENAME = "config.toml"
 PROJECT_BASENAME = "pcmlink.toml"
 
@@ -1129,6 +1130,22 @@ def add_shared(sp):
                     help="run preflight, print the pipeline, and exit")
 
 
+def trim_log(path: str, limit: int = LOG_LIMIT) -> None:
+    """Past the limit, keep the newest half. Done when a program starts: what the
+    sender and agent log is a few lines a day, so that is often enough."""
+    try:
+        size = os.path.getsize(path)
+        if size <= limit:
+            return
+        with open(path, "rb") as fh:
+            fh.seek(size - limit // 2)
+            tail = fh.read()
+        with open(path, "wb") as fh:
+            fh.write(tail[tail.find(b"\n") + 1:])
+    except OSError:
+        pass  # a log that can't be trimmed is no reason not to run
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog=APP, description=__doc__.splitlines()[0])
     p.add_argument("--config", help="explicit config file, bypassing the search path")
@@ -1182,6 +1199,7 @@ def main(argv=None) -> int:
 
     if getattr(a, "log", None):
         os.makedirs(os.path.dirname(os.path.abspath(a.log)) or ".", exist_ok=True)
+        trim_log(a.log)
         # Held open for the lifetime of the process on purpose.
         fh = open(a.log, "a", buffering=1)  # noqa: SIM115
         sys.stdout = fh

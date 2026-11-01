@@ -11,6 +11,7 @@
 //! writes atomics the network thread looks at, so it cannot delay the audio.
 
 mod control;
+mod log;
 mod net;
 mod output;
 mod rtp;
@@ -25,7 +26,7 @@ use std::time::{Duration, Instant};
 
 const USAGE: &str = "usage: pcmlink-rx [--port 5004] [--bind 0.0.0.0] [--device NAME] [--volume 1.0]
                   [--gate SECONDS] [--idle 10] [--margin-ms 10] [--io-frames N]
-                  [--rate 48000] [--payload 96] [--no-stats]
+                  [--rate 48000] [--payload 96] [--stats-every 60] [--no-stats]
 
   --device     output device whose name contains NAME; empty = the current default output
   --volume     gain, 1.0 = unity (0 to 8)
@@ -37,6 +38,8 @@ const USAGE: &str = "usage: pcmlink-rx [--port 5004] [--bind 0.0.0.0] [--device 
                to the sender's bursts on top of this
   --io-frames  ask the device for this I/O block size (default: leave it to CoreAudio;
                a small value makes every client of the device cycle faster)
+  --stats-every  print the statistics line this often while the output runs, in
+               seconds; a change in a loss or dropout counter prints it at once
 
 A mixer (pcmlink-mixer) finds this receiver through its control socket, in
 ~/Library/Application Support/pcmlink/rx/ or $PCMLINK_RX_DIR.";
@@ -99,6 +102,7 @@ struct Opts {
     rate: u32,
     payload: u8,
     stats: bool,
+    stats_every: u64,
 }
 
 impl Opts {
@@ -115,6 +119,7 @@ impl Opts {
             rate: 48_000,
             payload: 96,
             stats: true,
+            stats_every: 60,
         };
         while let Some(flag) = args.next() {
             if flag == "--no-stats" {
@@ -139,6 +144,7 @@ impl Opts {
                 "--io-frames" => o.io_frames = Some(num(&flag, &value)?),
                 "--rate" => o.rate = num(&flag, &value)?,
                 "--payload" => o.payload = num(&flag, &value)?,
+                "--stats-every" => o.stats_every = num(&flag, &value)?,
                 _ => return Err(format!("unknown option {flag}")),
             }
         }
@@ -163,6 +169,7 @@ pub fn clock() -> String {
 }
 
 fn main() {
+    log::keep_within_budget();
     let opts = Opts::parse(std::env::args().skip(1)).unwrap_or_else(|e| {
         if !e.is_empty() {
             eprintln!("pcmlink-rx: {e}");
@@ -272,6 +279,7 @@ fn supervise(
     let mut next = Instant::now() + Duration::from_secs(1);
     let mut last = (Instant::now(), 0u64);
     let mut first: Option<(Instant, u64)> = None;
+    let mut printed_counts = [0u64; 7];
     loop {
         match events.recv_timeout(next.saturating_duration_since(Instant::now())) {
             Ok(Ctl::Wake) if !on => {
@@ -310,6 +318,24 @@ fn supervise(
                     continue;
                 }
                 let now = Instant::now();
+                let counts = [
+                    shared.lost.load(Relaxed),
+                    shared.late.load(Relaxed),
+                    shared.dup.load(Relaxed),
+                    shared.gap_frames.load(Relaxed),
+                    shared.underruns.load(Relaxed),
+                    shared.resets.load(Relaxed),
+                    shared.overflows.load(Relaxed),
+                ];
+                // A line when something went wrong, at once, and otherwise a
+                // sign of life now and then. A stopped output has nothing to say:
+                // going idle and waking are logged when they happen. Live numbers
+                // are on the control socket.
+                let due = on && now.duration_since(last.0).as_secs() >= opts.stats_every;
+                if counts == printed_counts && !due {
+                    continue;
+                }
+                printed_counts = counts;
                 let packets = shared.packets.load(Relaxed);
                 let rate = (packets - last.1) as f64 / now.duration_since(last.0).as_secs_f64();
                 last = (now, packets);
@@ -337,6 +363,7 @@ fn supervise(
                     shared.drift_ppm.load(Relaxed),
                     if on { "on" } else { "idle" },
                 );
+                log::keep_within_budget();
             }
         }
     }
