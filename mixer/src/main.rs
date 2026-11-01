@@ -11,17 +11,15 @@ mod ui;
 mod workers;
 
 use std::collections::HashSet;
-use std::io;
+use std::io::{self, Write};
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
-    MouseButton, MouseEvent, MouseEventKind,
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use ratatui::crossterm::execute;
 use serde_json::{json, Value};
 
 use model::{step_gain, to_db, to_linear, Model, Strip, FLOOR_DB};
@@ -407,9 +405,39 @@ impl Mixer {
     }
 }
 
+/// Clicks and the wheel. crossterm's EnableMouseCapture also asks for every movement
+/// of the mouse, which nothing here reads.
+fn mouse_capture(on: bool) -> io::Result<()> {
+    let mut out = io::stdout();
+    out.write_all(if on { b"\x1b[?1000h\x1b[?1006h" } else { b"\x1b[?1006l\x1b[?1000l" })?;
+    out.flush()
+}
+
+/// Wait for input, for at most `wait`, and handle all that has come, so that a key
+/// reaches the screen without waiting for the next frame. False to quit.
+fn take_input(mixer: &mut Mixer, wait: Duration) -> io::Result<bool> {
+    if !event::poll(wait)? {
+        return Ok(true);
+    }
+    loop {
+        match event::read()? {
+            Event::Key(key) => {
+                if !mixer.key(key) {
+                    return Ok(false);
+                }
+            }
+            Event::Mouse(mouse) => mixer.mouse(mouse),
+            _ => {}
+        }
+        if !event::poll(Duration::ZERO)? {
+            return Ok(true);
+        }
+    }
+}
+
 fn run_tui(opts: &Opts) -> io::Result<()> {
     let mut terminal = ratatui::init();
-    execute!(io::stdout(), EnableMouseCapture)?;
+    mouse_capture(true)?;
     let mut mixer = Mixer::new(opts);
     let mut last = Instant::now();
     let result = loop {
@@ -420,33 +448,14 @@ fn run_tui(opts: &Opts) -> io::Result<()> {
         if let Err(e) = terminal.draw(|frame| ui::draw(frame, &mut mixer)) {
             break Err(e);
         }
-        let mut go = true;
-        let deadline = now + FRAME;
-        while go {
-            let wait = deadline.saturating_duration_since(Instant::now());
-            match event::poll(wait) {
-                Ok(false) => break,
-                Ok(true) => match event::read() {
-                    Ok(Event::Key(key)) => go = mixer.key(key),
-                    Ok(Event::Mouse(mouse)) => mixer.mouse(mouse),
-                    Ok(_) => {}
-                    Err(e) => {
-                        ratatui::restore();
-                        return Err(e);
-                    }
-                },
-                Err(e) => {
-                    ratatui::restore();
-                    return Err(e);
-                }
-            }
-        }
-        if !go {
-            break Ok(());
+        match take_input(&mut mixer, (now + FRAME).saturating_duration_since(Instant::now())) {
+            Ok(true) => {}
+            Ok(false) => break Ok(()),
+            Err(e) => break Err(e),
         }
     };
     mixer.clear_solo();
-    let _ = execute!(io::stdout(), DisableMouseCapture);
+    let _ = mouse_capture(false);
     ratatui::restore();
     result
 }
