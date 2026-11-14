@@ -6,6 +6,9 @@ plays it through a chosen audio device on another, as RTP/L16 over UDP.
 No compression, no discovery, no GUI, no account, no cloud. One sender, one
 receiver, one UDP port.
 
+The write-ups: [pcmlink: a PC's audio on the Mac, over the LAN](https://0xmch.xyz/posts/pcmlink/) and
+[part two: a native receiver and a mixer](https://0xmch.xyz/posts/pcmlink-rx-and-mixer/).
+
 ## Platform support
 
 Any machine can receive. Sending needs something to capture: Windows and Linux
